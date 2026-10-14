@@ -45,12 +45,14 @@ app = Client(
 )
 
 active_processes = {}
-user_job_controls = {} # user_id -> {"action": None} ("pause", "cancel")
+user_job_controls = {} 
 playlist_cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 60
 
 authorized_users = set()
 user_selected_channels = {} 
+user_audio_mode = {}        # user_id -> "all" or "hi"
+user_record_mode = {}       # user_id -> "norm" or "wm"
 user_waiting_duration = {}  
 
 def fetch_fresh_playlist():
@@ -320,7 +322,6 @@ async def callback_cancel_active(client: Client, callback_query: CallbackQuery):
     except Exception:
         pass
 
-# Recording Control Callbacks (Pause & Send vs Cancel)
 @app.on_callback_query(filters.regex(r"^job_control_(pause|cancel)$"))
 async def job_control_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -335,7 +336,7 @@ async def job_control_callback(client: Client, callback_query: CallbackQuery):
 
     user_job_controls[user_id] = action
     if action == "pause":
-        await callback_query.answer("⏸️ Pausing and preparing partial file for delivery...", show_alert=True)
+        await callback_query.answer("⏸️ Pausing and preparing partial file...", show_alert=True)
     else:
         await callback_query.answer("❌ Recording cancelled.", show_alert=True)
 
@@ -431,16 +432,41 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
         await callback_query.answer("⚠️ Please select at least one channel first!", show_alert=True)
         return
 
+    # STEP 1: AUDIO TRACK SELECTION MENU
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔴 Record Normal", callback_data="mode_norm"),
-            InlineKeyboardButton("🎨 Record + Watermark", callback_data="mode_wm")
+            InlineKeyboardButton("🎵 All Audio Tracks", callback_data="audio_all"),
+            InlineKeyboardButton("🎵 Hindi Audio Only", callback_data="audio_hi")
         ],
         [InlineKeyboardButton("« Back", callback_data="prompt_search")]
     ])
 
     await callback_query.message.edit_text(
-        f"🎯 **Selected Channels:** `{list(selected)}`\n\nChoose recording mode:",
+        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Audio Tracks Option:",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex(r"^audio_(all|hi)$"))
+async def audio_select_callback(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id not in authorized_users:
+        await callback_query.answer("Authentication required!", show_alert=True)
+        return
+
+    audio_mode = callback_query.matches[0].group(1)
+    user_audio_mode[user_id] = audio_mode
+
+    # STEP 2: RECORDING MODE MENU (Record Normal vs Record with Watermark)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔴 Record Normal", callback_data="mode_norm"),
+            InlineKeyboardButton("🎨 Record + Watermark", callback_data="mode_wm")
+        ],
+        [InlineKeyboardButton("« Back", callback_data="confirm_channels")]
+    ])
+
+    await callback_query.message.edit_text(
+        f"⚙️ **Audio Mode:** `{'All Audio Tracks' if audio_mode == 'all' else 'Hindi Only'}`\n\nChoose Recording Mode:",
         reply_markup=keyboard
     )
 
@@ -452,22 +478,20 @@ async def mode_select_callback(client: Client, callback_query: CallbackQuery):
         return
 
     mode = callback_query.matches[0].group(1)
+    user_record_mode[user_id] = mode
     selected = user_selected_channels.get(user_id, set())
-    if not selected:
-        await callback_query.answer("No channels selected.", show_alert=True)
-        return
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⏱ 1 Min", callback_data=f"dur_{mode}_00:01:00"),
-            InlineKeyboardButton("⏱ 5 Mins", callback_data=f"dur_{mode}_00:05:00")
+            InlineKeyboardButton("⏱ 1 Min", callback_data=f"dur_00:01:00"),
+            InlineKeyboardButton("⏱ 5 Mins", callback_data=f"dur_00:05:00")
         ],
         [
-            InlineKeyboardButton("⏱ 30 Mins", callback_data=f"dur_{mode}_00:30:00"),
-            InlineKeyboardButton("⏱ 1 Hour", callback_data=f"dur_{mode}_01:00:00")
+            InlineKeyboardButton("⏱ 30 Mins", callback_data=f"dur_00:30:00"),
+            InlineKeyboardButton("⏱ 1 Hour", callback_data=f"dur_01:00:00")
         ],
         [
-            InlineKeyboardButton("⏱ Custom Duration", callback_data=f"dur_custom_{mode}")
+            InlineKeyboardButton("⏱ Custom Duration", callback_data="dur_custom")
         ]
     ])
 
@@ -476,15 +500,14 @@ async def mode_select_callback(client: Client, callback_query: CallbackQuery):
         reply_markup=keyboard
     )
 
-@app.on_callback_query(filters.regex(r"^dur_custom_(norm|wm)$"))
+@app.on_callback_query(filters.regex(r"^dur_custom$"))
 async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in authorized_users:
         await callback_query.answer("Authentication required!", show_alert=True)
         return
 
-    mode = callback_query.matches[0].group(1)
-    user_waiting_duration[user_id] = mode
+    user_waiting_duration[user_id] = True
 
     await callback_query.answer()
     await callback_query.message.edit_text(
@@ -497,10 +520,10 @@ async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
 @app.on_message(filters.text & ~filters.command(["start", "auth", "menu", "s"]))
 async def custom_duration_text_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id not in authorized_users or user_id not in user_waiting_duration:
+    if user_id not in authorized_users or not user_waiting_duration.get(user_id):
         return
 
-    mode = user_waiting_duration.pop(user_id)
+    user_waiting_duration.pop(user_id, None)
     text = message.text.strip()
 
     duration_str = "00:05:00"
@@ -520,11 +543,11 @@ async def custom_duration_text_handler(client: Client, message: Message):
     status_msg = await message.reply_text(f"🚀 Starting rips for {len(selected)} channels...")
     
     for channel_num in selected:
-        await execute_rip_process(client, message.chat.id, user_id, channel_num, mode, duration_str, status_msg)
+        await execute_rip_process(client, message.chat.id, user_id, channel_num, duration_str, status_msg)
 
     user_selected_channels[user_id] = set()
 
-@app.on_callback_query(filters.regex(r"^dur_(norm|wm)_(\d{2}:\d{2}:\d{2})$"))
+@app.on_callback_query(filters.regex(r"^dur_(\d{2}:\d{2}:\d{2})$"))
 async def preset_duration_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in authorized_users:
@@ -532,8 +555,7 @@ async def preset_duration_callback(client: Client, callback_query: CallbackQuery
         return
 
     await callback_query.answer("Starting rip process...")
-    mode = callback_query.matches[0].group(1)
-    duration_str = callback_query.matches[0].group(2)
+    duration_str = callback_query.matches[0].group(1)
 
     selected = list(user_selected_channels.get(user_id, set()))
     if not selected:
@@ -542,11 +564,11 @@ async def preset_duration_callback(client: Client, callback_query: CallbackQuery
 
     status_msg = callback_query.message
     for channel_num in selected:
-        await execute_rip_process(client, callback_query.message.chat.id, user_id, channel_num, mode, duration_str, status_msg)
+        await execute_rip_process(client, callback_query.message.chat.id, user_id, channel_num, duration_str, status_msg)
 
     user_selected_channels[user_id] = set()
 
-async def execute_rip_process(client, chat_id, user_id, channel_num, mode, duration_str, status_msg):
+async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str, status_msg):
     content = await asyncio.to_thread(fetch_fresh_playlist)
     if not content:
         await status_msg.edit_text("❌ Error fetching live playlist through proxy.")
@@ -562,6 +584,9 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
         await status_msg.edit_text(f"❌ Error: Could not extract stream URL for channel {channel_num}.")
         return
 
+    audio_selection = user_audio_mode.get(user_id, "all")
+    record_mode = user_record_mode.get(user_id, "norm")
+
     job_id = f"{user_id}_{int(time.time())}"
     temp_prefix_local = f"raw_stream_{job_id}"
     output_filename = f"{clean_name}_{job_id}.mp4"
@@ -571,18 +596,16 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
         "N_m3u8DL-RE",
         url,
         "--save-name", temp_prefix_local,
-        "--use-shaka-packager",
         "--live-real-time-merge", 
         "--live-record-limit", duration_str,
         "--custom-proxy", DOWNLOAD_PROXY,
         "--select-video", "best",
-        "--select-audio", "all",
+        "--select-audio", audio_selection,
         "--thread-count", "16"
     ]
     command.extend(headers)
     command.extend(drm_keys)
 
-    # Reset any previous control states for this user
     user_job_controls[user_id] = None
 
     try:
@@ -650,7 +673,6 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
         action_taken = user_job_controls.pop(user_id, None)
         if action_taken == "cancel":
             await status_msg.edit_text("❌ Recording cancelled by user.")
-            # Cleanup files
             for f in glob.glob(f"{temp_prefix_local}*") + [output_filename, thumb_path_local]:
                 try:
                     os.remove(f)
@@ -665,21 +687,33 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
             await status_msg.edit_text("❌ Error: No media chunks found to process.")
             return
 
-        # Smart Muxing Partial/Full Tracks
-        await status_msg.edit_text(f"⚙️ **Muxing Partial/Full Tracks (Hindi Default)...**\n\n{make_progress_bar(50)}")
+        # SMART MUXING WITH PRECISE DASH OVERLAP WINDOW TRIMMING
+        await status_msg.edit_text(f"⚙️ **Smart Muxing & Syncing Tracks...**\n\n{make_progress_bar(50)}")
         
         audio_files.sort(key=lambda f: 0 if 'hi' in f.lower() else 1)
-        all_tracks = video_files + audio_files
+        all_files = video_files + audio_files
+
+        max_start = 0.0
+        min_end = float('inf')
+
+        for f in all_files:
+            start, end = await asyncio.to_thread(get_media_info, f)
+            if start > max_start: max_start = start
+            if end < min_end: min_end = end
 
         mux_cmd = ["ffmpeg"]
-        for f in all_tracks:
+        for f in all_files:
             mux_cmd.extend(["-i", f])
 
-        for i in range(len(all_tracks)):
+        for i in range(len(all_files)):
             mux_cmd.extend(["-map", str(i)])
 
         mux_cmd.extend([
             "-c", "copy",
+            "-copyts",
+            "-ss", str(max_start),
+            "-to", str(min_end),
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             "-y", output_filename
         ])
@@ -689,7 +723,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
 
         final_file = output_filename
 
-        if mode == "wm":
+        if record_mode == "wm":
             await status_msg.edit_text(f"🎨 **Applying Watermark Filter...**\n\n{make_progress_bar(50)}")
             watermarked_path = f"wm_{output_filename}"
             wm_filter = get_watermark_drawtext_filter()
@@ -734,7 +768,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
         )
         await status_msg.delete()
 
-        for f in all_tracks + [output_filename, f"wm_{output_filename}", thumb_path_local]:
+        for f in all_files + [output_filename, f"wm_{output_filename}", thumb_path_local]:
             try:
                 os.remove(f)
             except Exception:
@@ -746,5 +780,5 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, mode, durat
         await status_msg.edit_text(f"❌ Error during execution: {e}")
 
 if __name__ == "__main__":
-    print("Bot starting up with Pause/Cancel control buttons...", flush=True)
+    print("Bot starting up with Audio Track selection menu & complete feature set...", flush=True)
     app.run()
