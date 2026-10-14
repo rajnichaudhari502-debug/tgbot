@@ -10,6 +10,7 @@ import signal
 import logging
 import asyncio
 import subprocess
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 from wzgram import Client, filters
@@ -50,6 +51,12 @@ SPLIT_TARGET = 1_600_000_000                    # aim for parts of about this si
 MIN_FREE_BYTES = 500 * 1024 * 1024              # auto-stop a recording if free disk drops below this
 PROGRESS_INTERVAL = 8                           # seconds between progress message edits
 MAX_SEARCH_RESULTS = 30
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BOT_DIR, "logs")        # downloader output of every recording (keys/proxy masked)
+DL_RETRIES = 3                                  # attempts per recording if the downloader dies right away
+STALE_MAX_AGE = 600                             # a cached playlist older than this is never used (seconds)
+USE_BINARY_MERGE = False                        # set True if audio/video sync is off (same effect as fake.py's hide_ffmpeg)
 
 proxy_dict = {
     "scheme": "http",
@@ -103,6 +110,86 @@ LANG_NAMES = {
 # ==========================================
 # HELPERS
 # ==========================================
+SHAKA_NAMES = [
+    "shaka-packager", "packager", "packager-win-x64", "packager-linux-x64",
+    "packager-linux-arm64", "packager-osx-x64"
+]
+
+
+def find_tool(names):
+    """PATH first, then the bot folder / working folder."""
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    for folder in {BOT_DIR, os.getcwd()}:
+        for n in names:
+            for ext in ("", ".exe"):
+                p = os.path.join(folder, n + ext)
+                if os.path.isfile(p):
+                    return p
+    return None
+
+
+TOOLS = {
+    "N_m3u8DL-RE": find_tool(["N_m3u8DL-RE"]),
+    "shaka-packager": find_tool(SHAKA_NAMES),
+    "ffmpeg": find_tool(["ffmpeg"]),
+    "ffprobe": find_tool(["ffprobe"]),
+}
+DL_BIN = TOOLS["N_m3u8DL-RE"] or "N_m3u8DL-RE"
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def extract_error(tail):
+    """Pull the useful error lines out of the downloader output."""
+    text = ANSI_RE.sub("", "".join(tail)).replace("\r", "\n")
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    keyed = [
+        l for l in lines
+        if re.search(r"error|exception|fail|not found|denied|forbidden|unauthori|40[0-9]|50[0-9]|invalid|unable|timed out|refused|no such", l, re.I)
+    ]
+    picked = (keyed or lines)[-4:]
+    return " | ".join(picked)[-450:].replace("`", "'") or "downloader exited without any output"
+
+
+def mask_command(cmd):
+    """Command line for the log file - keys and proxy credentials hidden."""
+    out, hide_next = [], False
+    for a in cmd:
+        if hide_next:
+            out.append("***")
+            hide_next = False
+            continue
+        out.append(a)
+        if a in ("--key", "--custom-proxy", "-H"):
+            hide_next = True
+    return " ".join(out)
+
+
+def prune_logs(keep=40):
+    try:
+        files = sorted(glob.glob(os.path.join(LOGS_DIR, "*.log")), key=os.path.getmtime, reverse=True)
+        for f in files[keep:]:
+            safe_remove(f)
+    except Exception:
+        pass
+
+
+def collect_raw_files(job_dir):
+    raw = [
+        os.path.join(job_dir, f) for f in os.listdir(job_dir)
+        if f.startswith(TEMP_PREFIX)
+        and os.path.isfile(os.path.join(job_dir, f))
+        and os.path.getsize(os.path.join(job_dir, f)) > 0
+    ]
+    media = [f for f in raw if f.lower().endswith(MEDIA_EXTS)]
+    if not media:
+        media = [f for f in raw if not f.endswith(('.jpg', '.srt', '.vtt'))]
+    return sorted(media)
+
+
 def is_authorized(user) -> bool:
     return bool(user) and user.id in AUTHORIZED_USERS
 
@@ -143,23 +230,48 @@ def fmt_duration(seconds):
     return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def fetch_fresh_playlist():
-    global playlist_cache
-    current_time = time.time()
-    if playlist_cache["data"] and (current_time - playlist_cache["timestamp"] < CACHE_TTL):
-        return playlist_cache["data"]
+_playlist_lock = threading.Lock()
 
-    logger.info("Fetching fresh playlist via proxy using requests...")
-    try:
-        proxies = {'http': DOWNLOAD_PROXY, 'https': DOWNLOAD_PROXY}
-        response = requests.get(PLAYLIST_URL, proxies=proxies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        response.raise_for_status()
-        playlist_cache["data"] = response.text
-        playlist_cache["timestamp"] = current_time
-        return response.text
-    except Exception as e:
-        logger.error(f"Failed to fetch playlist through proxy: {e}")
-        return playlist_cache.get("data")
+
+def _download_playlist():
+    response = requests.get(
+        PLAYLIST_URL,
+        proxies={'http': DOWNLOAD_PROXY, 'https': DOWNLOAD_PROXY},
+        headers={'User-Agent': 'Mozilla/5.0'},
+        timeout=20
+    )
+    response.raise_for_status()
+    if "#EXTINF" not in response.text:
+        raise ValueError("response is not a playlist")
+    return response.text
+
+
+def fetch_fresh_playlist(max_age=CACHE_TTL, allow_stale=True):
+    """
+    max_age   : reuse the cached copy only if it is younger than this (0 = always download).
+    allow_stale: if every download attempt fails, fall back to the old copy (only if < STALE_MAX_AGE).
+                 Recordings pass allow_stale=False - old keys/tokens just make the downloader die.
+    """
+    with _playlist_lock:
+        age = time.time() - playlist_cache["timestamp"]
+        if playlist_cache["data"] and age < max_age:
+            return playlist_cache["data"]
+
+        for attempt in range(1, 4):
+            try:
+                logger.info("Fetching fresh playlist via proxy (try %d/3)...", attempt)
+                text = _download_playlist()
+                playlist_cache["data"] = text
+                playlist_cache["timestamp"] = time.time()
+                return text
+            except Exception as e:
+                logger.error("Playlist fetch failed (try %d/3): %s", attempt, e)
+                time.sleep(2)
+
+        if allow_stale and playlist_cache["data"] and (time.time() - playlist_cache["timestamp"]) < STALE_MAX_AGE:
+            logger.warning("Using a stale playlist (%.0fs old)", time.time() - playlist_cache["timestamp"])
+            return playlist_cache["data"]
+        return None
 
 
 def parse_playlist_blocks(content):
@@ -499,6 +611,7 @@ async def start_handler(client: Client, message: Message):
         "• `/s <name>` - Search & select channels\n"
         "• `/r <num[,num2,...]> [min|HH:MM:SS|inf]` - Quick record (e.g. `/r 12 30`, `/r 12,15 inf`)\n"
         "• `/jobs` - See / stop running recordings\n"
+        "• `/refresh` - Force a fresh playlist (new keys)\n"
         "• `/menu` - Control dashboard\n\n"
         "You can run as many recordings in parallel as you like.",
         reply_markup=keyboard
@@ -511,6 +624,20 @@ async def menu_handler(client: Client, message: Message):
         await message.reply_text(NOT_AUTH_TEXT)
         return
     await message.reply_text("🎛 **Jio Bot Control Panel**\nChoose an action below:", reply_markup=main_menu_markup())
+
+
+@app.on_message(filters.command("refresh"))
+async def refresh_handler(client: Client, message: Message):
+    """Force-download a brand new playlist (new keys/tokens) right now."""
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
+        return
+    msg = await message.reply_text("🔄 Downloading a fresh playlist...")
+    content = await asyncio.to_thread(fetch_fresh_playlist, 0, False)
+    if not content:
+        await msg.edit_text("❌ Could not download the playlist through the proxy.")
+        return
+    await msg.edit_text(f"✅ Playlist refreshed: **{len(parse_playlist_blocks(content))}** channels.")
 
 
 @app.on_message(filters.command("jobs"))
@@ -576,7 +703,7 @@ async def callback_bot_stats(client: Client, callback_query: CallbackQuery):
         f"• **Your recordings:** `{len(user_jobs(callback_query.from_user.id))}`\n"
         f"• **Total Playlist Channels:** `{total_channels}`\n"
         f"• **Free Disk Space:** `{fmt_size(free)}`\n"
-        f"• **Proxy Status:** `Connected ✅`",
+        + "".join(f"• **{n}:** `{'✅' if p else '❌ not found'}`\n" for n, p in TOOLS.items()),
         keyboard
     )
 
@@ -773,7 +900,7 @@ async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
     )
 
 
-@app.on_message(filters.text & ~filters.command(["start", "menu", "s", "r", "jobs"]))
+@app.on_message(filters.text & ~filters.command(["start", "menu", "s", "r", "jobs", "refresh"]))
 async def custom_duration_text_handler(client: Client, message: Message):
     if not is_authorized(message.from_user):
         return
@@ -896,16 +1023,23 @@ async def stop_process(proc, graceful):
     await proc.wait()
 
 
-async def drain_stdout(proc, tail):
-    """Consume process output so the pipe never fills; keep a short tail for debugging."""
+async def drain_stdout(proc, tail, log_fh):
+    """Consume process output (so the pipe never fills), keep a tail, and write the log file."""
     try:
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk:
                 break
-            tail.append(chunk.decode("utf-8", errors="ignore"))
-            if len(tail) > 20:
-                del tail[:-20]
+            text = chunk.decode("utf-8", errors="ignore")
+            tail.append(text)
+            if len(tail) > 40:
+                del tail[:-40]
+            if log_fh:
+                try:
+                    log_fh.write(ANSI_RE.sub("", text))
+                    log_fh.flush()
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -924,102 +1058,27 @@ async def split_file(path, out_dir, total_sec, size_bytes):
     return sorted(glob.glob(os.path.join(out_dir, "part_*.mkv")))
 
 
-async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str):
-    job_id = uuid.uuid4().hex[:8]
-    job_dir = os.path.join(JOBS_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+async def download_once(job, job_dir, command, log_path, on_progress, attempt):
+    """Run N_m3u8DL-RE once and watch it. Returns (action, tail)."""
+    # clean folder for every attempt
+    for name in os.listdir(job_dir):
+        safe_remove(os.path.join(job_dir, name))
 
-    job = {
-        "user_id": user_id, "chat_id": chat_id, "channel_num": channel_num,
-        "title": f"Channel {channel_num}", "duration_str": duration_str,
-        "proc": None, "action": None, "stage": "starting", "start": time.time(), "note": ""
-    }
-    jobs[job_id] = job
-    status_msg = None
+    popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    # NOTE: no cwd override - the downloader must run from the same folder as before so it
+    # can still find shaka-packager / ffmpeg if they sit next to the bot instead of on PATH.
+    proc = await asyncio.create_subprocess_exec(
+        *command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen_kwargs
+    )
+    job["proc"] = proc
+    job["stage"] = "recording"
+    job["start"] = time.time()
+    tail = []
 
-    try:
-        status_msg = await client.send_message(chat_id, f"⏳ Preparing channel `{channel_num}`...")
-
-        content = await asyncio.to_thread(fetch_fresh_playlist)
-        if not content:
-            await safe_edit(status_msg, "❌ Error fetching live playlist through proxy.")
-            return "error"
-
-        fresh_channels = parse_playlist_blocks(content)
-        if channel_num not in fresh_channels:
-            await safe_edit(status_msg, f"❌ Channel `{channel_num}` not found in fresh playlist.")
-            return "error"
-
-        url, clean_name, drm_keys, headers = parse_m3u_block(fresh_channels[channel_num]["block"])
-        if not url:
-            await safe_edit(status_msg, f"❌ Could not extract stream URL for channel {channel_num}.")
-            return "error"
-
-        title = fresh_channels[channel_num]["name"]
-        job["title"] = title
-        record_mode = user_record_mode.get(user_id, "norm")
-
-        stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-        output_filename = os.path.join(job_dir, f"{clean_name}_{stamp}.mkv")
-        watermarked_path = os.path.join(job_dir, f"wm_{clean_name}_{stamp}.mkv")
-        thumb_path_local = os.path.join(job_dir, "thumb.jpg")
-
-        command = [
-            "N_m3u8DL-RE", url,
-            "--save-name", TEMP_PREFIX,
-            "--save-dir", job_dir,
-            "--tmp-dir", job_dir,
-            "--use-shaka-packager",
-            "--live-real-time-merge",
-        ]
-        if duration_str:
-            command.extend(["--live-record-limit", duration_str])
-        command.extend([
-            "--custom-proxy", DOWNLOAD_PROXY,
-            "--select-video", "best",
-            "--select-audio", AUDIO_SELECTION,
-            "--thread-count", "16"
-        ])
-        command.extend(headers)
-        command.extend(drm_keys)
-
-        control_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹ Stop & Send", callback_data=f"job_stop_{job_id}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"job_cancel_{job_id}")
-        ]])
-
-        total_expected_sec = 0
-        if duration_str:
-            h, m, s = map(int, duration_str.split(':'))
-            total_expected_sec = h * 3600 + m * 60 + s
-
-        def progress_text(elapsed, size_now):
-            if total_expected_sec:
-                pct = int(min(99, elapsed / total_expected_sec * 100))
-                body = make_progress_bar(pct)
-                target = duration_str
-            else:
-                body = "♾ Unlimited - recording until you press Stop"
-                target = "Unlimited"
-            return (
-                f"⏺ **Ripping Channel {channel_num}:** `{title}`\n"
-                f"🆔 `{job_id}`\n"
-                f"🎯 Target: `{target}`\n"
-                f"⏱ Elapsed: `{fmt_duration(elapsed)}`\n"
-                f"💾 Recorded: `{fmt_size(size_now)}`\n\n{body}"
-            )
-
-        await safe_edit(status_msg, progress_text(0, 0), control_markup)
-
-        popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
-        proc = await asyncio.create_subprocess_exec(
-            *command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=job_dir, **popen_kwargs
-        )
-        job["proc"] = proc
-        job["stage"] = "recording"
-        job["start"] = time.time()
-        tail = []
-        drain_task = asyncio.create_task(drain_stdout(proc, tail))
+    with open(log_path, "a", encoding="utf-8", errors="ignore") as log_fh:
+        log_fh.write(f"\n===== attempt {attempt} @ {datetime.now(TZ).strftime('%H:%M:%S')} =====\n")
+        log_fh.write(mask_command(command) + "\n\n")
+        drain_task = asyncio.create_task(drain_stdout(proc, tail, log_fh))
 
         last_edit = 0
         while proc.returncode is None:
@@ -1038,39 +1097,171 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             if now - last_edit >= PROGRESS_INTERVAL:
                 last_edit = now
                 size_now = await asyncio.to_thread(dir_size, job_dir)
-                await safe_edit(status_msg, progress_text(now - job["start"], size_now), control_markup)
+                await on_progress(now - job["start"], size_now)
 
             await asyncio.sleep(1)
 
-        action_taken = job["action"]
+        action = job["action"]
         if proc.returncode is None:
-            await stop_process(proc, graceful=(action_taken != "cancel"))
+            await stop_process(proc, graceful=(action != "cancel"))
         await proc.wait()
         await drain_task
-        elapsed_total = time.time() - job["start"]
+        log_fh.write(f"\n[exit code {proc.returncode}]\n")
 
-        if action_taken == "cancel":
-            await safe_edit(status_msg, f"❌ Recording of `{title}` cancelled.")
-            return "cancelled"
+    return action, tail
+
+
+async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str):
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    log_path = os.path.join(LOGS_DIR, f"ch{channel_num}_{job_id}.log")
+
+    job = {
+        "user_id": user_id, "chat_id": chat_id, "channel_num": channel_num,
+        "title": f"Channel {channel_num}", "duration_str": duration_str,
+        "proc": None, "action": None, "stage": "starting", "start": time.time(), "note": ""
+    }
+    jobs[job_id] = job
+    status_msg = None
+
+    try:
+        status_msg = await client.send_message(chat_id, f"⏳ Preparing channel `{channel_num}`...")
+        record_mode = user_record_mode.get(user_id, "norm")
+
+        total_expected_sec = 0
+        if duration_str:
+            h, m, s = map(int, duration_str.split(':'))
+            total_expected_sec = h * 3600 + m * 60 + s
+
+        control_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏹ Stop & Send", callback_data=f"job_stop_{job_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"job_cancel_{job_id}")
+        ]])
+
+        attempt = 0
+        action_taken = None
+        all_files = []
+        tail = []
+        fail_reason = ""
+        title = job["title"]
+        clean_name = "Recording"
+
+        # ==========================================
+        # DOWNLOAD (with automatic retries)
+        # ==========================================
+        while True:
+            attempt += 1
+
+            # A recording ALWAYS gets a fresh playlist (first attempt may share a <=15s old copy
+            # with the other recordings of the same batch). Never an old cached copy.
+            content = await asyncio.to_thread(fetch_fresh_playlist, 15 if attempt == 1 else 0, False)
+            if not content:
+                fail_reason = "could not download a fresh playlist through the proxy"
+                if attempt < DL_RETRIES:
+                    await safe_edit(status_msg, f"⚠️ `{title}`: {fail_reason}. Retrying ({attempt}/{DL_RETRIES})...")
+                    await asyncio.sleep(5)
+                    continue
+                await safe_edit(status_msg, f"❌ `{title}`: {fail_reason}.")
+                return "error"
+
+            fresh_channels = parse_playlist_blocks(content)
+            if channel_num not in fresh_channels:
+                await safe_edit(status_msg, f"❌ Channel `{channel_num}` not found in fresh playlist.")
+                return "error"
+
+            url, clean_name, drm_keys, headers = parse_m3u_block(fresh_channels[channel_num]["block"])
+            if not url:
+                await safe_edit(status_msg, f"❌ Could not extract stream URL for channel {channel_num}.")
+                return "error"
+
+            title = fresh_channels[channel_num]["name"]
+            job["title"] = title
+
+            command = [
+                DL_BIN, url,
+                "--save-name", TEMP_PREFIX,
+                "--save-dir", job_dir,
+                "--tmp-dir", job_dir,
+                "--use-shaka-packager",
+                "--live-real-time-merge",
+            ]
+            if TOOLS["shaka-packager"]:
+                command.extend(["--decryption-binary-path", TOOLS["shaka-packager"]])
+            if USE_BINARY_MERGE:
+                command.append("--binary-merge")
+            if duration_str:
+                command.extend(["--live-record-limit", duration_str])
+            command.extend([
+                "--custom-proxy", DOWNLOAD_PROXY,
+                "--select-video", "best",
+                "--select-audio", AUDIO_SELECTION,
+                "--thread-count", "16"
+            ])
+            command.extend(headers)
+            command.extend(drm_keys)
+
+            def progress_text(elapsed, size_now, _title=title, _attempt=attempt):
+                if total_expected_sec:
+                    body = make_progress_bar(int(min(99, elapsed / total_expected_sec * 100)))
+                    target = duration_str
+                else:
+                    body = "♾ Unlimited - recording until you press Stop"
+                    target = "Unlimited"
+                retry = f"🔁 Attempt {_attempt}/{DL_RETRIES}\n" if _attempt > 1 else ""
+                return (
+                    f"⏺ **Ripping Channel {channel_num}:** `{_title}`\n"
+                    f"🆔 `{job_id}`\n{retry}"
+                    f"🎯 Target: `{target}`\n"
+                    f"⏱ Elapsed: `{fmt_duration(elapsed)}`\n"
+                    f"💾 Recorded: `{fmt_size(size_now)}`\n\n{body}"
+                )
+
+            async def on_progress(elapsed, size_now, _pt=progress_text):
+                await safe_edit(status_msg, _pt(elapsed, size_now), control_markup)
+
+            await safe_edit(status_msg, progress_text(0, 0), control_markup)
+            action_taken, tail = await download_once(job, job_dir, command, log_path, on_progress, attempt)
+
+            if action_taken == "cancel":
+                await safe_edit(status_msg, f"❌ Recording of `{title}` cancelled.")
+                return "cancelled"
+
+            all_files = collect_raw_files(job_dir)
+            if all_files:
+                break
+
+            # ---- downloader produced nothing ----
+            fail_reason = extract_error(tail)
+            logger.error("[%s] attempt %d produced no files: %s", job_id, attempt, fail_reason)
+            if action_taken is None and attempt < DL_RETRIES:
+                await safe_edit(
+                    status_msg,
+                    f"⚠️ `{title}`: attempt {attempt}/{DL_RETRIES} failed.\n`{fail_reason}`\n\n"
+                    f"Retrying with a fresh playlist in 5s..."
+                )
+                await asyncio.sleep(5)
+                continue
+
+            await safe_edit(
+                status_msg,
+                f"❌ `{title}`: recording failed after {attempt} attempt(s).\n\n"
+                f"**Downloader said:**\n`{fail_reason}`\n\n"
+                f"Full log: `logs/{os.path.basename(log_path)}`"
+            )
+            return "error"
+
+        elapsed_total = time.time() - job["start"]
+        stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(job_dir, f"{clean_name}_{stamp}.mkv")
+        watermarked_path = os.path.join(job_dir, f"wm_{clean_name}_{stamp}.mkv")
+        thumb_path_local = os.path.join(job_dir, "thumb.jpg")
 
         # ==========================================
         # SMART MUXING (Hindi audio first)
         # ==========================================
         job["stage"] = "muxing"
-        all_raw = [
-            os.path.join(job_dir, f) for f in os.listdir(job_dir)
-            if f.startswith(TEMP_PREFIX) and os.path.isfile(os.path.join(job_dir, f))
-        ]
-        all_files = [f for f in all_raw if f.lower().endswith(MEDIA_EXTS)]
-        if not all_files:
-            all_files = [f for f in all_raw if not f.endswith(('.jpg', '.srt', '.vtt'))]
-        all_files.sort()
-
-        if not all_files:
-            logger.error("N_m3u8DL-RE output tail: %s", "".join(tail)[-1500:])
-            await safe_edit(status_msg, f"❌ `{title}`: no decrypted tracks found (stream may be offline or keys expired).")
-            return "error"
-
         await safe_edit(status_msg, f"⚙️ **Muxing `{title}` (Hindi audio first)...**\n\n{make_progress_bar(50)}")
 
         max_start = 0.0
@@ -1122,10 +1313,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
         final_size = os.path.getsize(final_file)
         upload_list = [final_file]
         if final_size > TG_LIMIT:
-            await safe_edit(
-                status_msg,
-                f"✂️ **File is {fmt_size(final_size)} - splitting into parts for Telegram...**"
-            )
+            await safe_edit(status_msg, f"✂️ **File is {fmt_size(final_size)} - splitting into parts for Telegram...**")
             parts = await split_file(final_file, job_dir, actual_sec, final_size)
             if parts:
                 upload_list = parts
@@ -1144,17 +1332,15 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             else:
                 part_sec = actual_sec
 
-            caption = build_caption(
-                title, streams, part_sec, size_p, duration_str, record_mode, note, part_info
-            )
+            caption = build_caption(title, streams, part_sec, size_p, duration_str, record_mode, note, part_info)
 
             last_prog = {"t": 0}
 
-            async def upload_progress(current, total, _label=part_label):
+            async def upload_progress(current, total, _label=part_label, _lp=last_prog):
                 now = time.time()
-                if current != total and now - last_prog["t"] < 6:
+                if current != total and now - _lp["t"] < 6:
                     return
-                last_prog["t"] = now
+                _lp["t"] = now
                 pct = int(current * 100 / total) if total else 0
                 await safe_edit(
                     status_msg,
@@ -1177,6 +1363,8 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             await status_msg.delete()
         except Exception:
             pass
+        safe_remove(log_path)   # successful recording - log not needed
+        prune_logs()
         return "ok"
 
     except Exception as e:
@@ -1193,11 +1381,17 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
                 pass
         jobs.pop(job_id, None)
         safe_remove(job_dir)
+        prune_logs()
 
 
 if __name__ == "__main__":
-    # wipe leftovers from a previous crash, then make a clean jobs folder
+    # wipe leftovers from a previous crash, then make clean folders
     safe_remove(JOBS_DIR)
     os.makedirs(JOBS_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    print("---- tool check ----", flush=True)
+    for name, path in TOOLS.items():
+        print(f"{name:15s}: {path or '!!! NOT FOUND !!!'}", flush=True)
+    print("--------------------", flush=True)
     print("Bot starting up: unlimited parallel recordings, Hindi-first multi-audio...", flush=True)
     app.run()
