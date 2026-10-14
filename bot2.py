@@ -2,6 +2,8 @@ import os
 import re
 import glob
 import time
+import shutil
+import json
 import logging
 import asyncio
 import subprocess
@@ -25,7 +27,20 @@ PLAYLIST_URL = "http://premiumplugx.top/jiostb/mjelo.php?view=raw"
 
 DOWNLOAD_PROXY = "http://kunanisaitarun:nxx9ge29bp0e@103.243.119.172:59100"
 DEFAULT_FONT_PATH = os.path.abspath("SNAP.TTF")
-BOT_PASSWORD = "xcdfgh"
+
+# Hardcoded authorised users (no /auth needed)
+AUTHORIZED_USERS = {
+    7802806467,
+    8980140588,
+    6905747168,
+    8952935309,
+}
+
+# Language tags/tokens treated as Hindi
+HINDI_TAGS = {"hi", "hin", "hindi"}
+
+# Always record every audio track
+AUDIO_SELECTION = "all"
 
 proxy_dict = {
     "scheme": "http",
@@ -37,23 +52,32 @@ proxy_dict = {
 
 print("Initializing Pyrogram Client with full proxy routing...", flush=True)
 app = Client(
-    "jio_bot_session_v3", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
+    "jio_bot_session_v3",
+    api_id=API_ID,
+    api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     proxy=proxy_dict
 )
 
 active_processes = {}
-user_job_controls = {} 
+user_job_controls = {}
+running_users = set()
 playlist_cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 60
 
-authorized_users = set()
-user_selected_channels = {} 
-user_audio_mode = {}        # "all" or language code
+user_selected_channels = {}
 user_record_mode = {}       # "norm" or "wm"
-user_waiting_duration = {}  
+user_waiting_duration = {}
+
+MEDIA_EXTS = (".mp4", ".ts", ".m4a", ".aac", ".mka", ".mkv", ".ac3", ".eac3", ".m4s")
+
+
+# ==========================================
+# HELPERS
+# ==========================================
+def is_authorized(user) -> bool:
+    return bool(user) and user.id in AUTHORIZED_USERS
+
 
 def fetch_fresh_playlist():
     global playlist_cache
@@ -76,6 +100,7 @@ def fetch_fresh_playlist():
         logger.error(f"Failed to fetch playlist through proxy: {e}")
         return playlist_cache.get("data")
 
+
 def parse_playlist_blocks(content):
     if not content:
         return {}
@@ -93,6 +118,7 @@ def parse_playlist_blocks(content):
         channel_num += 1
     return channels
 
+
 def parse_m3u_block(block_text):
     stream_url = ""
     clean_name = "Recording"
@@ -108,6 +134,7 @@ def parse_m3u_block(block_text):
     name_match = re.search(r'tvg-name="([^"]+)"', block_text)
     if name_match:
         clean_name = re.sub(r'[\\/*?:"<>|]', "", name_match.group(1).strip())
+        clean_name = re.sub(r'\s+', "_", clean_name) or "Recording"
 
     key_match = re.search(r'#KODIPROP:inputstream\.adaptive\.license_key=(.*)', block_text)
     if key_match:
@@ -129,9 +156,10 @@ def parse_m3u_block(block_text):
 
     return stream_url, clean_name, drm_keys, headers
 
+
 def get_watermark_drawtext_filter():
     font_path = DEFAULT_FONT_PATH
-    escaped_font = font_path.replace(":", r"\:")
+    escaped_font = font_path.replace("\\", "/").replace(":", r"\:")
     font_arg = f"fontfile='{escaped_font}':" if os.path.exists(font_path) else ""
 
     text = "Join Our Telegram - @Atoztoonsverse"
@@ -149,9 +177,10 @@ def get_watermark_drawtext_filter():
         f"x={x}:y={y}{enable_arg}"
     )
 
+
 def get_media_info(filepath):
     cmd = ["ffmpeg", "-hide_banner", "-i", filepath]
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+).*?start:\s*(\-?\d+\.\d+)", result.stderr)
     if match:
         h, m, s, start_str = match.groups()
@@ -159,6 +188,88 @@ def get_media_info(filepath):
         start = float(start_str)
         return start, start + duration
     return 0.0, float('inf')
+
+
+def probe_streams(filepath):
+    """Return a list of {index, type, lang} for every stream in a file."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=index,codec_type:stream_tags=language",
+        "-of", "json", filepath
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout or "{}")
+        streams = []
+        for s in data.get("streams", []):
+            streams.append({
+                "index": s.get("index"),
+                "type": s.get("codec_type"),
+                "lang": (s.get("tags", {}).get("language") or "").lower()
+            })
+        return streams
+    except Exception as e:
+        logger.warning(f"ffprobe failed for {filepath}: {e}")
+        return []
+
+
+def filename_is_hindi(filepath, prefix):
+    """Check the part of the filename after the save-name prefix for a Hindi tag."""
+    base = os.path.basename(filepath)
+    suffix = base[len(prefix):] if base.startswith(prefix) else base
+    tokens = re.split(r"[._\-\s]+", suffix.lower())
+    return any(t in HINDI_TAGS for t in tokens)
+
+
+def is_hindi_stream(lang, filepath, prefix):
+    if lang in HINDI_TAGS:
+        return True
+    if not lang or lang in ("und", "unk"):
+        return filename_is_hindi(filepath, prefix)
+    return False
+
+
+def build_mux_command(all_files, prefix, max_start, min_end, output_filename):
+    """Build ffmpeg mux cmd: video first, then audio (Hindi first), then subs."""
+    video, audio, subs = [], [], []
+
+    for fi, f in enumerate(all_files):
+        for s in probe_streams(f):
+            entry = (fi, s["index"], is_hindi_stream(s["lang"], f, prefix))
+            if s["type"] == "video":
+                video.append(entry)
+            elif s["type"] == "audio":
+                audio.append(entry)
+            elif s["type"] == "subtitle":
+                subs.append(entry)
+
+    cmd = ["ffmpeg", "-hide_banner"]
+    for f in all_files:
+        cmd.extend(["-i", f])
+
+    if video or audio or subs:
+        audio.sort(key=lambda e: 0 if e[2] else 1)  # stable: Hindi first, rest keep order
+        for fi, si, _ in video + audio + subs:
+            cmd.extend(["-map", f"{fi}:{si}"])
+        for a_idx in range(len(audio)):
+            cmd.extend([f"-disposition:a:{a_idx}", "default" if a_idx == 0 else "0"])
+    else:
+        # ffprobe unavailable - fall back to file level ordering (Hindi files first among audio)
+        order = sorted(
+            range(len(all_files)),
+            key=lambda i: 0 if filename_is_hindi(all_files[i], prefix) else 1
+        )
+        vids = [i for i in order if not all_files[i].lower().endswith((".m4a", ".aac", ".mka", ".ac3", ".eac3"))]
+        auds = [i for i in order if i not in vids]
+        for i in vids + auds:
+            cmd.extend(["-map", str(i)])
+
+    cmd.extend(["-c", "copy", "-copyts", "-ss", str(max_start)])
+    if min_end != float('inf'):
+        cmd.extend(["-to", str(min_end)])
+    cmd.extend(["-avoid_negative_ts", "make_zero", "-y", output_filename])
+    return cmd
+
 
 def generate_thumbnail(video_path, thumb_path):
     try:
@@ -177,25 +288,59 @@ def generate_thumbnail(video_path, thumb_path):
         pass
     return None
 
+
 def make_progress_bar(percent):
     percent = max(0, min(100, percent))
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     return f"[{bar}] {percent}%"
 
+
+def normalize_duration(text):
+    """Return HH:MM:SS from '10' (minutes) or 'HH:MM:SS', else None."""
+    text = text.strip()
+    if text.isdigit():
+        mins = int(text)
+        if mins <= 0:
+            return None
+        return f"{mins // 60:02d}:{mins % 60:02d}:00"
+    if re.match(r"^\d{2}:\d{2}:\d{2}$", text):
+        h, m, s = map(int, text.split(":"))
+        if h * 3600 + m * 60 + s > 0:
+            return text
+    return None
+
+
+def safe_remove(path):
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def mode_menu_markup():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔴 Record Normal", callback_data="mode_norm"),
+            InlineKeyboardButton("🎨 Record + Watermark", callback_data="mode_wm")
+        ],
+        [InlineKeyboardButton("« Back", callback_data="prompt_search")]
+    ])
+
+
 # ==========================================
 # COMMAND & MENU HANDLERS
 # ==========================================
+NOT_AUTH_TEXT = "🚫 **Access Denied**\n\nYou are not authorized to use this bot."
+
 
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in authorized_users:
-        await message.reply_text(
-            "🔒 **Authentication Required**\n\n"
-            "This bot is password protected. Please authenticate using:\n"
-            "`/auth <password>`"
-        )
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
         return
 
     keyboard = InlineKeyboardMarkup([
@@ -209,26 +354,11 @@ async def start_handler(client: Client, message: Message):
         reply_markup=keyboard
     )
 
-@app.on_message(filters.command("auth"))
-async def auth_handler(client: Client, message: Message):
-    args = message.command[1:]
-    if not args:
-        await message.reply_text("⚠️ Please provide the password. Example: `/auth xcdfgh`")
-        return
-    
-    pwd = args[0].strip()
-    user_id = message.from_user.id
-    if pwd == BOT_PASSWORD:
-        authorized_users.add(user_id)
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎛 Open Control Menu", callback_data="main_menu")]])
-        await message.reply_text("✅ **Authentication Successful!** You now have access to the bot.", reply_markup=keyboard)
-    else:
-        await message.reply_text("❌ **Incorrect Password!** Access denied.")
 
 @app.on_message(filters.command("menu"))
 async def menu_handler(client: Client, message: Message):
-    if message.from_user.id not in authorized_users:
-        await message.reply_text("🔒 Please authenticate first using `/auth <password>`")
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
         return
 
     keyboard = InlineKeyboardMarkup([
@@ -241,10 +371,11 @@ async def menu_handler(client: Client, message: Message):
         reply_markup=keyboard
     )
 
+
 @app.on_callback_query(filters.regex(r"^main_menu$"))
 async def callback_main_menu(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     await callback_query.answer()
@@ -261,10 +392,11 @@ async def callback_main_menu(client: Client, callback_query: CallbackQuery):
     except Exception:
         pass
 
+
 @app.on_callback_query(filters.regex(r"^prompt_search$"))
 async def callback_prompt_search(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     await callback_query.answer()
@@ -275,17 +407,18 @@ async def callback_prompt_search(client: Client, callback_query: CallbackQuery):
     except Exception:
         pass
 
+
 @app.on_callback_query(filters.regex(r"^bot_stats$"))
 async def callback_bot_stats(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     await callback_query.answer("Fetching live stats...")
     content = await asyncio.to_thread(fetch_fresh_playlist)
     total_channels = len(parse_playlist_blocks(content))
     active_jobs = len(active_processes)
-    
+
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="main_menu")]])
     try:
         await callback_query.message.edit_text(
@@ -298,52 +431,59 @@ async def callback_bot_stats(client: Client, callback_query: CallbackQuery):
     except Exception:
         pass
 
+
 @app.on_callback_query(filters.regex(r"^cancel_active$"))
 async def callback_cancel_active(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
-    if user_id in active_processes:
+    proc = active_processes.get(user_id)
+    if proc:
         try:
-            active_processes[user_id].terminate()
-            del active_processes[user_id]
             user_job_controls[user_id] = "cancel"
+            proc.terminate()
             await callback_query.answer("Active rip process terminated.", show_alert=True)
         except Exception:
             await callback_query.answer("Failed to terminate process.", show_alert=True)
     else:
         await callback_query.answer("No active rip found for you.", show_alert=True)
-    
+
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="main_menu")]])
     try:
         await callback_query.message.edit_text("❌ Active download processes cleared.", reply_markup=keyboard)
     except Exception:
         pass
 
+
 @app.on_callback_query(filters.regex(r"^job_control_(pause|cancel)$"))
 async def job_control_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    action = callback_query.matches[0].group(1)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
+        return
 
-    if user_id in active_processes:
+    action = callback_query.matches[0].group(1)
+    user_job_controls[user_id] = action
+
+    proc = active_processes.get(user_id)
+    if proc:
         try:
-            active_processes[user_id].terminate()
-            del active_processes[user_id]
+            proc.terminate()
         except Exception:
             pass
 
-    user_job_controls[user_id] = action
     if action == "pause":
         await callback_query.answer("⏸️ Pausing and preparing partial file...", show_alert=True)
     else:
         await callback_query.answer("❌ Recording cancelled.", show_alert=True)
 
+
 @app.on_message(filters.command("s"))
 async def search_handler(client: Client, message: Message):
-    if message.from_user.id not in authorized_users:
-        await message.reply_text("🔒 Please authenticate first using `/auth <password>`")
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
         return
 
     query = " ".join(message.command[1:]).strip().lower()
@@ -353,7 +493,7 @@ async def search_handler(client: Client, message: Message):
 
     status_msg = await message.reply_text("🔍 Fetching fresh playlist via proxy & parsing channels...")
     content = await asyncio.to_thread(fetch_fresh_playlist)
-    
+
     if not content:
         await status_msg.edit_text("❌ Failed to fetch playlist from remote server through proxy.")
         return
@@ -370,21 +510,23 @@ async def search_handler(client: Client, message: Message):
     keyboard = []
     for num, data in list(matched.items())[:12]:
         keyboard.append([InlineKeyboardButton(f"☐ {num}. {data['name']}", callback_data=f"toggle_chan_{num}")])
-    
+
     keyboard.append([InlineKeyboardButton("🚀 Proceed with Selected Channels", callback_data="confirm_channels")])
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="main_menu")])
 
     await status_msg.edit_text(
-        f"✅ Found **{len(matched)}** channels matching `{query}`.\n"
+        f"✅ Found **{len(matched)}** channels matching `{query}`"
+        f"{' (showing first 12)' if len(matched) > 12 else ''}.\n"
         f"Tap channels to select/deselect them, then click Proceed:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
 @app.on_callback_query(filters.regex(r"^toggle_chan_(\d+)$"))
 async def toggle_channel_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     channel_num = int(callback_query.matches[0].group(1))
@@ -400,8 +542,11 @@ async def toggle_channel_callback(client: Client, callback_query: CallbackQuery)
 
     content = await asyncio.to_thread(fetch_fresh_playlist)
     channels = parse_playlist_blocks(content)
-    
+
     reply_markup = callback_query.message.reply_markup
+    if not reply_markup:
+        return
+
     new_keyboard = []
     for row in reply_markup.inline_keyboard:
         new_row = []
@@ -420,11 +565,12 @@ async def toggle_channel_callback(client: Client, callback_query: CallbackQuery)
     except Exception:
         pass
 
+
 @app.on_callback_query(filters.regex(r"^confirm_channels$"))
 async def confirm_channels_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     selected = user_selected_channels.get(user_id, set())
@@ -432,61 +578,27 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
         await callback_query.answer("⚠️ Please select at least one channel first!", show_alert=True)
         return
 
-    # STEP 1: AUDIO TRACK SELECTION (All Audio vs Specific Tracks)
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎵 All Audio Tracks (Recommended)", callback_data="audio_all"),
-            InlineKeyboardButton("🎵 Hindi Audio Only", callback_data="audio_hi")
-        ],
-        [
-            InlineKeyboardButton("🎵 English Audio", callback_data="audio_en"),
-            InlineKeyboardButton("🎵 Tamil Audio", callback_data="audio_ta")
-        ],
-        [
-            InlineKeyboardButton("🎵 Telugu Audio", callback_data="audio_te"),
-            InlineKeyboardButton("🎵 Kannada Audio", callback_data="audio_kan")
-        ],
-        [InlineKeyboardButton("« Back", callback_data="prompt_search")]
-    ])
+    await callback_query.answer()
+    # Audio track menu removed: all audio tracks are always recorded (Hindi is placed first when muxing)
+    try:
+        await callback_query.message.edit_text(
+            f"🎯 **Selected Channels:** `{sorted(selected)}`\n"
+            f"🎵 **Audio:** All tracks (Hindi first)\n\nChoose Recording Mode:",
+            reply_markup=mode_menu_markup()
+        )
+    except Exception:
+        pass
 
-    await callback_query.message.edit_text(
-        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Audio Option:",
-        reply_markup=keyboard
-    )
-
-@app.on_callback_query(filters.regex(r"^audio_(all|hi|en|ta|te|kan)$"))
-async def audio_select_callback(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
-        return
-
-    audio_mode = callback_query.matches[0].group(1)
-    user_audio_mode[user_id] = audio_mode
-
-    # STEP 2: RECORDING MODE (Normal vs Watermark)
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔴 Record Normal", callback_data="mode_norm"),
-            InlineKeyboardButton("🎨 Record + Watermark", callback_data="mode_wm")
-        ],
-        [InlineKeyboardButton("« Back", callback_data="confirm_channels")]
-    ])
-
-    await callback_query.message.edit_text(
-        f"⚙️ **Audio Mode:** `{audio_mode.upper()}`\n\nChoose Recording Mode:",
-        reply_markup=keyboard
-    )
 
 @app.on_callback_query(filters.regex(r"^mode_(norm|wm)$"))
 async def mode_select_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
-    mode = callback_query.matches[0].group(1)
-    user_record_mode[user_id] = mode
+    await callback_query.answer()
+    user_record_mode[user_id] = callback_query.matches[0].group(1)
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -499,19 +611,21 @@ async def mode_select_callback(client: Client, callback_query: CallbackQuery):
         ],
         [
             InlineKeyboardButton("⏱ Custom Duration", callback_data="dur_custom")
-        ]
+        ],
+        [InlineKeyboardButton("« Back", callback_data="confirm_channels")]
     ])
 
     await callback_query.message.edit_text(
-        f"⏱ **Select Recording Duration:**",
+        "⏱ **Select Recording Duration:**",
         reply_markup=keyboard
     )
+
 
 @app.on_callback_query(filters.regex(r"^dur_custom$"))
 async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
         return
 
     user_waiting_duration[user_id] = True
@@ -524,98 +638,128 @@ async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
         "• Format 2: Exact timestamp `HH:MM:SS` (e.g. `00:15:00`)"
     )
 
-@app.on_message(filters.text & ~filters.command(["start", "auth", "menu", "s"]))
+
+@app.on_message(filters.text & ~filters.command(["start", "menu", "s"]))
 async def custom_duration_text_handler(client: Client, message: Message):
+    if not is_authorized(message.from_user):
+        return
     user_id = message.from_user.id
-    if user_id not in authorized_users or not user_waiting_duration.get(user_id):
+    if not user_waiting_duration.get(user_id):
         return
 
     user_waiting_duration.pop(user_id, None)
-    text = message.text.strip()
 
-    duration_str = "00:05:00"
-    if text.isdigit():
-        mins = int(text)
-        duration_str = f"00:{mins:02d}:00"
-    elif re.match(r"^\d{2}:\d{2}:\d{2}$", text):
-        duration_str = text
-    else:
+    duration_str = normalize_duration(message.text)
+    if not duration_str:
+        duration_str = "00:05:00"
         await message.reply_text("❌ Invalid format. Defaulting duration to `00:05:00`.")
 
-    selected = list(user_selected_channels.get(user_id, set()))
-    if not selected:
-        await message.reply_text("❌ No channels selected. Please search again using `/s`")
-        return
+    await start_rips(client, message.chat.id, user_id, duration_str)
 
-    status_msg = await message.reply_text(f"🚀 Starting rips for {len(selected)} channels...")
-    
-    for channel_num in selected:
-        await execute_rip_process(client, message.chat.id, user_id, channel_num, duration_str, status_msg)
-
-    user_selected_channels[user_id] = set()
 
 @app.on_callback_query(filters.regex(r"^dur_(\d{2}:\d{2}:\d{2})$"))
 async def preset_duration_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in authorized_users:
-        await callback_query.answer("Authentication required!", show_alert=True)
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
+        return
+
+    if not user_selected_channels.get(user_id):
+        await callback_query.answer("No channels selected.", show_alert=True)
+        return
+    if user_id in running_users:
+        await callback_query.answer("A recording is already running for you.", show_alert=True)
         return
 
     await callback_query.answer("Starting rip process...")
     duration_str = callback_query.matches[0].group(1)
 
-    selected = list(user_selected_channels.get(user_id, set()))
+    try:
+        await callback_query.message.edit_text("🚀 Starting rips...")
+    except Exception:
+        pass
+
+    await start_rips(client, callback_query.message.chat.id, user_id, duration_str)
+
+
+async def start_rips(client, chat_id, user_id, duration_str):
+    selected = sorted(user_selected_channels.get(user_id, set()))
     if not selected:
-        await callback_query.answer("No channels selected.", show_alert=True)
+        await client.send_message(chat_id, "❌ No channels selected. Please search again using `/s`")
+        return
+    if user_id in running_users:
+        await client.send_message(chat_id, "⚠️ A recording is already running. Cancel it first.")
         return
 
-    status_msg = callback_query.message
-    for channel_num in selected:
-        await execute_rip_process(client, callback_query.message.chat.id, user_id, channel_num, duration_str, status_msg)
-
     user_selected_channels[user_id] = set()
+    running_users.add(user_id)
+    try:
+        for channel_num in selected:
+            result = await execute_rip_process(client, chat_id, user_id, channel_num, duration_str)
+            if result == "cancelled":
+                break
+    finally:
+        running_users.discard(user_id)
 
-async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str, status_msg):
+
+async def drain_stdout(proc, tail):
+    """Consume process output so the pipe never fills up; keep a short tail for debugging."""
+    try:
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            tail.append(chunk.decode("utf-8", errors="ignore"))
+            if len(tail) > 20:
+                del tail[:-20]
+    except Exception:
+        pass
+
+
+async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str):
+    status_msg = await client.send_message(chat_id, f"⏳ Preparing channel `{channel_num}`...")
+
     content = await asyncio.to_thread(fetch_fresh_playlist)
     if not content:
         await status_msg.edit_text("❌ Error fetching live playlist through proxy.")
-        return
+        return "error"
 
     fresh_channels = parse_playlist_blocks(content)
     if channel_num not in fresh_channels:
         await status_msg.edit_text(f"❌ Channel `{channel_num}` not found in fresh playlist.")
-        return
+        return "error"
 
     url, clean_name, drm_keys, headers = parse_m3u_block(fresh_channels[channel_num]["block"])
     if not url:
         await status_msg.edit_text(f"❌ Error: Could not extract stream URL for channel {channel_num}.")
-        return
+        return "error"
 
-    audio_selection = user_audio_mode.get(user_id, "all")
+    channel_title = fresh_channels[channel_num]["name"]
     record_mode = user_record_mode.get(user_id, "norm")
 
     job_id = f"{user_id}_{int(time.time())}"
     temp_prefix_local = f"raw_stream_{job_id}"
-    output_filename = f"{clean_name}_{job_id}.mkv" # Match mkv container support for all audio tracks like fake.py
+    output_filename = f"{clean_name}_{job_id}.mkv"
+    watermarked_path = f"wm_{output_filename}"
     thumb_path_local = f"thumb_{job_id}.jpg"
 
-    # EXACT WORKING COMMAND FROM fake.py (Including --use-shaka-packager)[cite: 1]
     command = [
         "N_m3u8DL-RE",
         url,
         "--save-name", temp_prefix_local,
         "--use-shaka-packager",
-        "--live-real-time-merge", 
+        "--live-real-time-merge",
         "--live-record-limit", duration_str,
         "--custom-proxy", DOWNLOAD_PROXY,
         "--select-video", "best",
-        "--select-audio", audio_selection,
+        "--select-audio", AUDIO_SELECTION,   # always all audio tracks
         "--thread-count", "16"
     ]
     command.extend(headers)
     command.extend(drm_keys)
 
     user_job_controls[user_id] = None
+    result_status = "error"
 
     try:
         control_markup = InlineKeyboardMarkup([
@@ -625,136 +769,123 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             ]
         ])
 
-        await status_msg.edit_text(
-            f"⏺ **Ripping Channel {channel_num}:** `{fresh_channels[channel_num]['name']}`\n"
-            f"⏱ Target Duration: `{duration_str}`\n\n{make_progress_bar(0)}",
-            reply_markup=control_markup
-        )
-        
+        def progress_text(pct):
+            return (
+                f"⏺ **Ripping Channel {channel_num}:** `{channel_title}`\n"
+                f"⏱ Target Duration: `{duration_str}`\n\n{make_progress_bar(pct)}"
+            )
+
+        await status_msg.edit_text(progress_text(0), reply_markup=control_markup)
+
         proc = await asyncio.create_subprocess_exec(
-            *command, 
-            stdout=subprocess.PIPE, 
+            *command,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT
         )
         active_processes[user_id] = proc
+        tail = []
+        drain_task = asyncio.create_task(drain_stdout(proc, tail))
 
         h, m, s = map(int, duration_str.split(':'))
         total_expected_sec = h * 3600 + m * 60 + s
         start_time = time.time()
-        last_update_time = 0
+        last_pct = -1
 
-        while True:
-            if user_job_controls.get(user_id) in ["pause", "cancel"]:
+        while proc.returncode is None:
+            if user_job_controls.get(user_id) in ("pause", "cancel"):
                 break
 
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode('utf-8', errors='ignore').strip()
-            
-            current_time = time.time()
-            elapsed_sec = current_time - start_time
-
-            pct = None
-            if "%" in line_str:
-                match = re.search(r'(\d+(?:\.\d+)?)%', line_str)
-                if match:
-                    pct = int(float(match.group(1)))
-
-            if pct is None and total_expected_sec > 0:
-                pct = int(min(99, (elapsed_sec / total_expected_sec) * 100))
-
-            if pct is not None and (current_time - last_update_time > 3):
+            elapsed = time.time() - start_time
+            pct = int(min(99, (elapsed / total_expected_sec) * 100)) if total_expected_sec > 0 else 0
+            if pct != last_pct:
                 try:
-                    await status_msg.edit_text(
-                        f"⏺ **Ripping Channel {channel_num}:** `{fresh_channels[channel_num]['name']}`\n"
-                        f"⏱ Target Duration: `{duration_str}`\n\n{make_progress_bar(pct)}",
-                        reply_markup=control_markup
-                    )
-                    last_update_time = current_time
+                    await status_msg.edit_text(progress_text(pct), reply_markup=control_markup)
+                    last_pct = pct
                 except Exception:
                     pass
 
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=4)
+            except asyncio.TimeoutError:
+                pass
+
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         await proc.wait()
-        if user_id in active_processes:
-            del active_processes[user_id]
+        await drain_task
+        active_processes.pop(user_id, None)
 
         action_taken = user_job_controls.pop(user_id, None)
         if action_taken == "cancel":
             await status_msg.edit_text("❌ Recording cancelled by user.")
-            for f in glob.glob(f"{temp_prefix_local}*") + [output_filename, thumb_path_local]:
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-            return
+            result_status = "cancelled"
+            return result_status
 
         # ==========================================
-        # SMART MUXING EXACTLY MATCHING fake.py
+        # SMART MUXING (Hindi audio first)
         # ==========================================
-        video_files = glob.glob(f"{temp_prefix_local}*.mp4") + glob.glob(f"{temp_prefix_local}*.ts")
-        audio_files = glob.glob(f"{temp_prefix_local}*.m4a") + glob.glob(f"{temp_prefix_local}*.aac")
-        all_files = video_files + audio_files
+        all_raw = [f for f in glob.glob(f"{temp_prefix_local}*") if os.path.isfile(f)]
+        all_files = [f for f in all_raw if f.lower().endswith(MEDIA_EXTS)]
+        if not all_files:
+            all_files = [f for f in all_raw if not f.endswith(('.jpg', '.srt', '.vtt'))]
+        all_files.sort()
 
         if not all_files:
-            # Fallback broad glob
-            all_raw = glob.glob(f"{temp_prefix_local}*")
-            all_files = [f for f in all_raw if not f.endswith('.jpg') and f != output_filename and f != f"wm_{output_filename}"]
-
-        if not all_files:
+            logger.error("N_m3u8DL-RE output tail: %s", "".join(tail)[-1500:])
             await status_msg.edit_text("❌ Error: No decrypted tracks found.")
-            return
+            return "error"
 
-        await status_msg.edit_text(f"⚙️ **Smart Muxing & Syncing Tracks (fake.py engine)...**\n\n{make_progress_bar(50)}")
+        await status_msg.edit_text(f"⚙️ **Smart Muxing & Syncing Tracks (Hindi audio first)...**\n\n{make_progress_bar(50)}")
 
         max_start = 0.0
         min_end = float('inf')
-
         for f in all_files:
             start, end = await asyncio.to_thread(get_media_info, f)
-            if start > max_start: max_start = start
-            if end < min_end: min_end = end
+            if start > max_start:
+                max_start = start
+            if end < min_end:
+                min_end = end
 
-        mux_cmd = ["ffmpeg"]
-        for f in all_files:
-            mux_cmd.extend(["-i", f])
+        mux_cmd = await asyncio.to_thread(
+            build_mux_command, all_files, temp_prefix_local, max_start, min_end, output_filename
+        )
+        logger.info("Mux command: %s", " ".join(mux_cmd))
 
-        for i in range(len(all_files)):
-            mux_cmd.extend(["-map", str(i)])
+        mux_proc = await asyncio.create_subprocess_exec(
+            *mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        _, mux_err = await mux_proc.communicate()
 
-        mux_cmd.extend([
-            "-c", "copy",
-            "-copyts",
-            "-ss", str(max_start),
-            "-to", str(min_end),
-            "-avoid_negative_ts", "make_zero",
-            "-y", output_filename
-        ])
-
-        mux_proc = await asyncio.create_subprocess_exec(*mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        await mux_proc.communicate()
+        if not os.path.exists(output_filename) or os.path.getsize(output_filename) < 10000:
+            logger.error("Mux failed: %s", mux_err.decode("utf-8", errors="ignore")[-1500:])
+            await status_msg.edit_text("❌ Error: Muxing failed (output file missing or empty).")
+            return "error"
 
         final_file = output_filename
 
         if record_mode == "wm":
             await status_msg.edit_text(f"🎨 **Applying Watermark Filter...**\n\n{make_progress_bar(50)}")
-            watermarked_path = f"wm_{output_filename}"
             wm_filter = get_watermark_drawtext_filter()
-            
+
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
                 "-i", output_filename,
+                "-map", "0",
                 "-vf", wm_filter,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "23",
                 "-c:a", "copy",
+                "-c:s", "copy",
                 watermarked_path
             ]
-            
+
             ff_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             await ff_proc.communicate()
-            
+
             if os.path.exists(watermarked_path) and os.path.getsize(watermarked_path) > 50000:
                 final_file = watermarked_path
 
@@ -776,21 +907,32 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             video=final_file,
             duration=video_duration_sec,
             thumb=thumb_path if thumb_path else None,
-            caption=f"📺 Channel: {fresh_channels[channel_num]['name']}{suffix_label}\n⏱ Duration: {duration_str}"
+            supports_streaming=True,
+            caption=f"📺 Channel: {channel_title}{suffix_label}\n⏱ Duration: {duration_str}"
         )
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
-        for f in all_files + [output_filename, f"wm_{output_filename}", thumb_path_local]:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+        result_status = "ok"
+        return result_status
 
     except Exception as e:
-        if user_id in active_processes:
-            del active_processes[user_id]
-        await status_msg.edit_text(f"❌ Error during execution: {e}")
+        logger.exception("Rip failed")
+        try:
+            await status_msg.edit_text(f"❌ Error during execution: {e}")
+        except Exception:
+            pass
+        return "error"
+
+    finally:
+        active_processes.pop(user_id, None)
+        user_job_controls.pop(user_id, None)
+        for f in glob.glob(f"{temp_prefix_local}*") + [output_filename, watermarked_path, thumb_path_local]:
+            safe_remove(f)
+
 
 if __name__ == "__main__":
-    print("Bot starting up with fake.py engine & full multi-audio support...", flush=True)
+    print("Bot starting up with multi-audio (Hindi first) support...", flush=True)
     app.run()
