@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 API_ID = 31135256
 API_HASH = "6b31bb267109963bac7ddb8dd37fe09c"
-BOT_TOKEN = "8938316203:AAHTUfaP8qwgLOo3JPw8xw5mQYCibl_u_k8"
+BOT_TOKEN = "8938316203:AAFI1MMPoNXCwqf6p5yMnhkOZZuNM-Oo02Y"
 PLAYLIST_URL = "http://premiumplugx.top/jiostb/mjelo.php?view=raw"
 
 DOWNLOAD_PROXY = "http://kunanisaitarun:nxx9ge29bp0e@103.243.119.172:59100"
@@ -51,7 +51,7 @@ CACHE_TTL = 60
 
 authorized_users = set()
 user_selected_channels = {} 
-user_audio_mode = {}        # "all" or "hi"
+user_audio_mode = {}        # "all", "hi", or specific language code
 user_record_mode = {}       # "norm" or "wm"
 user_waiting_duration = {}  
 
@@ -176,8 +176,8 @@ def get_track_language_and_type(filepath):
             lang = lang_match.group(1).lower()
         else:
             base = os.path.basename(filepath).lower()
-            for l in ['hi', 'ta', 'te', 'en', 'bn', 'mr', 'gu', 'kn', 'ml', 'pa', 'ur']:
-                if f"_{l}_" in base or f"-{l}-" in base or base.endswith(f"_{l}.m4a") or base.endswith(f"_{l}.ts"):
+            for l in ['hi', 'ta', 'te', 'en', 'bn', 'mr', 'gu', 'kn', 'ml', 'pa', 'ur', 'or', 'as']:
+                if f"_{l}_" in base or f"-{l}-" in base or base.endswith(f"_{l}.m4a") or base.endswith(f"_{l}.ts") or f"lang_{l}" in base:
                     lang = l
                     break
     return stream_type, lang
@@ -454,21 +454,33 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
         await callback_query.answer("⚠️ Please select at least one channel first!", show_alert=True)
         return
 
-    # STEP 1: AUDIO TRACK SELECTION MENU
+    # STEP 1: EXTENSIVE AUDIO TRACK SELECTION MENU (All available individual tracks + All tracks option)
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎵 All Audio Tracks", callback_data="audio_all"),
+            InlineKeyboardButton("🎵 All Audio Tracks (Default)", callback_data="audio_all"),
             InlineKeyboardButton("🎵 Hindi Audio Only", callback_data="audio_hi")
+        ],
+        [
+            InlineKeyboardButton("🎵 English Audio", callback_data="audio_en"),
+            InlineKeyboardButton("🎵 Tamil Audio", callback_data="audio_ta")
+        ],
+        [
+            InlineKeyboardButton("🎵 Telugu Audio", callback_data="audio_te"),
+            InlineKeyboardButton("🎵 Kannada Audio", callback_data="audio_kan")
+        ],
+        [
+            InlineKeyboardButton("🎵 Malayalam Audio", callback_data="audio_ml"),
+            InlineKeyboardButton("🎵 Marathi Audio", callback_data="audio_mr")
         ],
         [InlineKeyboardButton("« Back", callback_data="prompt_search")]
     ])
 
     await callback_query.message.edit_text(
-        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Audio Tracks Option:",
+        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Desired Audio Track Option:",
         reply_markup=keyboard
     )
 
-@app.on_callback_query(filters.regex(r"^audio_(all|hi)$"))
+@app.on_callback_query(filters.regex(r"^audio_(all|hi|en|ta|te|kan|ml|mr)$"))
 async def audio_select_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in authorized_users:
@@ -488,7 +500,7 @@ async def audio_select_callback(client: Client, callback_query: CallbackQuery):
     ])
 
     await callback_query.message.edit_text(
-        f"⚙️ **Audio Mode:** `{'All Audio Tracks' if audio_mode == 'all' else 'Hindi Only'}`\n\nChoose Recording Mode:",
+        f"⚙️ **Audio Mode Selected:** `{audio_mode.upper()}`\n\nChoose Recording Mode:",
         reply_markup=keyboard
     )
 
@@ -613,6 +625,9 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
     output_filename = f"{clean_name}_{job_id}.mp4"
     thumb_path_local = f"thumb_{job_id}.jpg"
 
+    # Map user selection to N_m3u8DL-RE parameter
+    audio_param = "all" if audio_selection == "all" else audio_selection
+
     command = [
         "N_m3u8DL-RE",
         url,
@@ -621,7 +636,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
         "--live-record-limit", duration_str,
         "--custom-proxy", DOWNLOAD_PROXY,
         "--select-video", "best",
-        "--select-audio", audio_selection,
+        "--select-audio", audio_param,
         "--thread-count", "16"
     ]
     command.extend(headers)
@@ -702,7 +717,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             return
 
         # ==========================================
-        # ROBUST TRACK GLOBBING & DYNAMIC INSPECTION
+        # ROBUST TRACK DISCOVERY & MUXING
         # ==========================================
         all_raw_files = glob.glob(f"{temp_prefix_local}*")
         media_files = [f for f in all_raw_files if not f.endswith('.jpg') and f != output_filename and f != f"wm_{output_filename}"]
@@ -723,7 +738,7 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             else:
                 audio_files.append((f, lang))
 
-        # Sort audio files: Hindi ('hi') first
+        # Sort audio files: Hindi ('hi') first, followed by others alphabetically
         audio_files.sort(key=lambda x: (0 if 'hi' in x[1] or 'hi' in os.path.basename(x[0]).lower() else 1, x[1]))
         sorted_audio_paths = [item[0] for item in audio_files]
         all_files = video_files + sorted_audio_paths
@@ -815,5 +830,5 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
         await status_msg.edit_text(f"❌ Error during execution: {e}")
 
 if __name__ == "__main__":
-    print("Bot starting up with robust dynamic track discovery & full menu flow...", flush=True)
+    print("Bot starting up with extended individual audio track selection menu...", flush=True)
     app.run()
