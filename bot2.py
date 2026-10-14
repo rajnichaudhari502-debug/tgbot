@@ -51,7 +51,7 @@ CACHE_TTL = 60
 
 authorized_users = set()
 user_selected_channels = {} 
-user_audio_mode = {}        # "all", "hi", or specific language code
+user_audio_mode = {}        # "all" or language code
 user_record_mode = {}       # "norm" or "wm"
 user_waiting_duration = {}  
 
@@ -159,28 +159,6 @@ def get_media_info(filepath):
         start = float(start_str)
         return start, start + duration
     return 0.0, float('inf')
-
-def get_track_language_and_type(filepath):
-    cmd = ["ffmpeg", "-hide_banner", "-i", filepath]
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
-    
-    stream_type = "unknown"
-    lang = "und"
-    
-    if "Video:" in result.stderr:
-        stream_type = "video"
-    elif "Audio:" in result.stderr:
-        stream_type = "audio"
-        lang_match = re.search(r"Stream.*Audio.*?\(([a-zA-Z0-9_-]+)\)", result.stderr)
-        if lang_match:
-            lang = lang_match.group(1).lower()
-        else:
-            base = os.path.basename(filepath).lower()
-            for l in ['hi', 'ta', 'te', 'en', 'bn', 'mr', 'gu', 'kn', 'ml', 'pa', 'ur', 'or', 'as']:
-                if f"_{l}_" in base or f"-{l}-" in base or base.endswith(f"_{l}.m4a") or base.endswith(f"_{l}.ts") or f"lang_{l}" in base:
-                    lang = l
-                    break
-    return stream_type, lang
 
 def generate_thumbnail(video_path, thumb_path):
     try:
@@ -454,10 +432,10 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
         await callback_query.answer("⚠️ Please select at least one channel first!", show_alert=True)
         return
 
-    # STEP 1: EXTENSIVE AUDIO TRACK SELECTION MENU (All available individual tracks + All tracks option)
+    # STEP 1: AUDIO TRACK SELECTION (All Audio vs Specific Tracks)
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🎵 All Audio Tracks (Default)", callback_data="audio_all"),
+            InlineKeyboardButton("🎵 All Audio Tracks (Recommended)", callback_data="audio_all"),
             InlineKeyboardButton("🎵 Hindi Audio Only", callback_data="audio_hi")
         ],
         [
@@ -468,19 +446,15 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
             InlineKeyboardButton("🎵 Telugu Audio", callback_data="audio_te"),
             InlineKeyboardButton("🎵 Kannada Audio", callback_data="audio_kan")
         ],
-        [
-            InlineKeyboardButton("🎵 Malayalam Audio", callback_data="audio_ml"),
-            InlineKeyboardButton("🎵 Marathi Audio", callback_data="audio_mr")
-        ],
         [InlineKeyboardButton("« Back", callback_data="prompt_search")]
     ])
 
     await callback_query.message.edit_text(
-        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Desired Audio Track Option:",
+        f"🎯 **Selected Channels:** `{list(selected)}`\n\nSelect Audio Option:",
         reply_markup=keyboard
     )
 
-@app.on_callback_query(filters.regex(r"^audio_(all|hi|en|ta|te|kan|ml|mr)$"))
+@app.on_callback_query(filters.regex(r"^audio_(all|hi|en|ta|te|kan)$"))
 async def audio_select_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in authorized_users:
@@ -490,7 +464,7 @@ async def audio_select_callback(client: Client, callback_query: CallbackQuery):
     audio_mode = callback_query.matches[0].group(1)
     user_audio_mode[user_id] = audio_mode
 
-    # STEP 2: RECORDING MODE MENU
+    # STEP 2: RECORDING MODE (Normal vs Watermark)
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🔴 Record Normal", callback_data="mode_norm"),
@@ -500,7 +474,7 @@ async def audio_select_callback(client: Client, callback_query: CallbackQuery):
     ])
 
     await callback_query.message.edit_text(
-        f"⚙️ **Audio Mode Selected:** `{audio_mode.upper()}`\n\nChoose Recording Mode:",
+        f"⚙️ **Audio Mode:** `{audio_mode.upper()}`\n\nChoose Recording Mode:",
         reply_markup=keyboard
     )
 
@@ -622,21 +596,20 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
 
     job_id = f"{user_id}_{int(time.time())}"
     temp_prefix_local = f"raw_stream_{job_id}"
-    output_filename = f"{clean_name}_{job_id}.mp4"
+    output_filename = f"{clean_name}_{job_id}.mkv" # Match mkv container support for all audio tracks like fake.py
     thumb_path_local = f"thumb_{job_id}.jpg"
 
-    # Map user selection to N_m3u8DL-RE parameter
-    audio_param = "all" if audio_selection == "all" else audio_selection
-
+    # EXACT WORKING COMMAND FROM fake.py (Including --use-shaka-packager)[cite: 1]
     command = [
         "N_m3u8DL-RE",
         url,
         "--save-name", temp_prefix_local,
+        "--use-shaka-packager",
         "--live-real-time-merge", 
         "--live-record-limit", duration_str,
         "--custom-proxy", DOWNLOAD_PROXY,
         "--select-video", "best",
-        "--select-audio", audio_param,
+        "--select-audio", audio_selection,
         "--thread-count", "16"
     ]
     command.extend(headers)
@@ -717,31 +690,22 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             return
 
         # ==========================================
-        # ROBUST TRACK DISCOVERY & MUXING
+        # SMART MUXING EXACTLY MATCHING fake.py
         # ==========================================
-        all_raw_files = glob.glob(f"{temp_prefix_local}*")
-        media_files = [f for f in all_raw_files if not f.endswith('.jpg') and f != output_filename and f != f"wm_{output_filename}"]
+        video_files = glob.glob(f"{temp_prefix_local}*.mp4") + glob.glob(f"{temp_prefix_local}*.ts")
+        audio_files = glob.glob(f"{temp_prefix_local}*.m4a") + glob.glob(f"{temp_prefix_local}*.aac")
+        all_files = video_files + audio_files
 
-        if not media_files:
-            await status_msg.edit_text("❌ Error: No media chunks found to process.")
+        if not all_files:
+            # Fallback broad glob
+            all_raw = glob.glob(f"{temp_prefix_local}*")
+            all_files = [f for f in all_raw if not f.endswith('.jpg') and f != output_filename and f != f"wm_{output_filename}"]
+
+        if not all_files:
+            await status_msg.edit_text("❌ Error: No decrypted tracks found.")
             return
 
-        await status_msg.edit_text(f"⚙️ **Inspecting & Dynamic Muxing Tracks...**\n\n{make_progress_bar(50)}")
-
-        video_files = []
-        audio_files = []
-
-        for f in media_files:
-            stype, lang = await asyncio.to_thread(get_track_language_and_type, f)
-            if stype == "video":
-                video_files.append(f)
-            else:
-                audio_files.append((f, lang))
-
-        # Sort audio files: Hindi ('hi') first, followed by others alphabetically
-        audio_files.sort(key=lambda x: (0 if 'hi' in x[1] or 'hi' in os.path.basename(x[0]).lower() else 1, x[1]))
-        sorted_audio_paths = [item[0] for item in audio_files]
-        all_files = video_files + sorted_audio_paths
+        await status_msg.edit_text(f"⚙️ **Smart Muxing & Syncing Tracks (fake.py engine)...**\n\n{make_progress_bar(50)}")
 
         max_start = 0.0
         min_end = float('inf')
@@ -764,7 +728,6 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
             "-ss", str(max_start),
             "-to", str(min_end),
             "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
             "-y", output_filename
         ])
 
@@ -786,7 +749,6 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
                 "-preset", "veryfast",
                 "-crf", "23",
                 "-c:a", "copy",
-                "-movflags", "+faststart",
                 watermarked_path
             ]
             
@@ -830,5 +792,5 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
         await status_msg.edit_text(f"❌ Error during execution: {e}")
 
 if __name__ == "__main__":
-    print("Bot starting up with extended individual audio track selection menu...", flush=True)
+    print("Bot starting up with fake.py engine & full multi-audio support...", flush=True)
     app.run()
