@@ -2,12 +2,16 @@ import os
 import re
 import glob
 import time
-import shutil
+import uuid
+import math
 import json
+import shutil
+import signal
 import logging
 import asyncio
 import subprocess
 import requests
+from datetime import datetime, timezone, timedelta
 from wzgram import Client, filters
 from wzgram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -22,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 API_ID = 31135256
 API_HASH = "6b31bb267109963bac7ddb8dd37fe09c"
-BOT_TOKEN = "8938316203:AAHTUfaP8qwgLOo3JPw8xw5mQYCibl_u_k8"
+BOT_TOKEN = "8938316203:AAFI1MMPoNXCwqf6p5yMnhkOZZuNM-Oo02Y"
 PLAYLIST_URL = "http://premiumplugx.top/jiostb/mjelo.php?view=raw"
 
 DOWNLOAD_PROXY = "http://kunanisaitarun:nxx9ge29bp0e@103.243.119.172:59100"
@@ -36,11 +40,16 @@ AUTHORIZED_USERS = {
     8952935309,
 }
 
-# Language tags/tokens treated as Hindi
-HINDI_TAGS = {"hi", "hin", "hindi"}
+HINDI_TAGS = {"hi", "hin", "hindi"}      # Hindi audio always goes first
+AUDIO_SELECTION = "all"                  # always record every audio track
 
-# Always record every audio track
-AUDIO_SELECTION = "all"
+TZ = timezone(timedelta(hours=5, minutes=30))   # IST, used for caption timestamp
+JOBS_DIR = os.path.abspath("jobs")              # each recording gets its own folder here
+TG_LIMIT = 1_950_000_000                        # files bigger than this are split before upload
+SPLIT_TARGET = 1_600_000_000                    # aim for parts of about this size
+MIN_FREE_BYTES = 500 * 1024 * 1024              # auto-stop a recording if free disk drops below this
+PROGRESS_INTERVAL = 8                           # seconds between progress message edits
+MAX_SEARCH_RESULTS = 30
 
 proxy_dict = {
     "scheme": "http",
@@ -59,17 +68,36 @@ app = Client(
     proxy=proxy_dict
 )
 
-active_processes = {}
-user_job_controls = {}
-running_users = set()
+# job_id -> dict(user_id, chat_id, channel_num, title, proc, action, stage, start, note ...)
+jobs = {}
+background_tasks = set()
 playlist_cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 60
 
 user_selected_channels = {}
-user_record_mode = {}       # "norm" or "wm"
+user_record_mode = {}        # "norm" or "wm"
 user_waiting_duration = {}
 
 MEDIA_EXTS = (".mp4", ".ts", ".m4a", ".aac", ".mka", ".mkv", ".ac3", ".eac3", ".m4s")
+AUDIO_ONLY_EXTS = (".m4a", ".aac", ".mka", ".ac3", ".eac3")
+TEMP_PREFIX = "rawstream"
+
+LANG_NAMES = {
+    "hi": "Hindi", "hin": "Hindi", "hindi": "Hindi",
+    "en": "English", "eng": "English",
+    "ta": "Tamil", "tam": "Tamil",
+    "te": "Telugu", "tel": "Telugu",
+    "kn": "Kannada", "kan": "Kannada",
+    "ml": "Malayalam", "mal": "Malayalam",
+    "mr": "Marathi", "mar": "Marathi",
+    "bn": "Bengali", "ben": "Bengali",
+    "gu": "Gujarati", "guj": "Gujarati",
+    "pa": "Punjabi", "pan": "Punjabi",
+    "ur": "Urdu", "urd": "Urdu",
+    "or": "Odia", "ori": "Odia",
+    "ja": "Japanese", "jpn": "Japanese",
+    "ko": "Korean", "kor": "Korean",
+}
 
 
 # ==========================================
@@ -77,6 +105,42 @@ MEDIA_EXTS = (".mp4", ".ts", ".m4a", ".aac", ".mka", ".mkv", ".ac3", ".eac3", ".
 # ==========================================
 def is_authorized(user) -> bool:
     return bool(user) and user.id in AUTHORIZED_USERS
+
+
+def spawn(coro):
+    """Run a coroutine in the background so handlers return immediately."""
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+
+    def _done(t):
+        background_tasks.discard(t)
+        if not t.cancelled() and t.exception():
+            logger.error("Background task crashed: %r", t.exception())
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def safe_edit(msg, text, markup=None):
+    if not msg:
+        return
+    try:
+        await msg.edit_text(text, reply_markup=markup)
+    except Exception as e:
+        logger.debug("edit failed: %s", e)
+
+
+def fmt_size(num_bytes):
+    num = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024 or unit == "GB":
+            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+
+
+def fmt_duration(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
 def fetch_fresh_playlist():
@@ -87,10 +151,7 @@ def fetch_fresh_playlist():
 
     logger.info("Fetching fresh playlist via proxy using requests...")
     try:
-        proxies = {
-            'http': DOWNLOAD_PROXY,
-            'https': DOWNLOAD_PROXY,
-        }
+        proxies = {'http': DOWNLOAD_PROXY, 'https': DOWNLOAD_PROXY}
         response = requests.get(PLAYLIST_URL, proxies=proxies, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
         response.raise_for_status()
         playlist_cache["data"] = response.text
@@ -111,10 +172,7 @@ def parse_playlist_blocks(content):
         full_block = '#EXTINF' + block
         name_match = re.search(r'tvg-name="([^"]+)"', full_block)
         name = name_match.group(1).strip() if name_match else f"Channel_{channel_num}"
-        channels[channel_num] = {
-            "name": name,
-            "block": full_block.strip()
-        }
+        channels[channel_num] = {"name": name, "block": full_block.strip()}
         channel_num += 1
     return channels
 
@@ -191,10 +249,10 @@ def get_media_info(filepath):
 
 
 def probe_streams(filepath):
-    """Return a list of {index, type, lang} for every stream in a file."""
+    """Return a list of stream dicts (index, type, lang, codec, channels, width, height)."""
     cmd = [
         "ffprobe", "-v", "error",
-        "-show_entries", "stream=index,codec_type:stream_tags=language",
+        "-show_entries", "stream=index,codec_type,codec_name,channels,width,height:stream_tags=language",
         "-of", "json", filepath
     ]
     try:
@@ -205,7 +263,11 @@ def probe_streams(filepath):
             streams.append({
                 "index": s.get("index"),
                 "type": s.get("codec_type"),
-                "lang": (s.get("tags", {}).get("language") or "").lower()
+                "lang": (s.get("tags", {}).get("language") or "").lower(),
+                "codec": s.get("codec_name") or "",
+                "channels": s.get("channels"),
+                "width": s.get("width"),
+                "height": s.get("height"),
             })
         return streams
     except Exception as e:
@@ -214,7 +276,6 @@ def probe_streams(filepath):
 
 
 def filename_is_hindi(filepath, prefix):
-    """Check the part of the filename after the save-name prefix for a Hindi tag."""
     base = os.path.basename(filepath)
     suffix = base[len(prefix):] if base.startswith(prefix) else base
     tokens = re.split(r"[._\-\s]+", suffix.lower())
@@ -230,7 +291,7 @@ def is_hindi_stream(lang, filepath, prefix):
 
 
 def build_mux_command(all_files, prefix, max_start, min_end, output_filename):
-    """Build ffmpeg mux cmd: video first, then audio (Hindi first), then subs."""
+    """ffmpeg mux command: video first, then audio (Hindi first), then subtitles."""
     video, audio, subs = [], [], []
 
     for fi, f in enumerate(all_files):
@@ -248,18 +309,17 @@ def build_mux_command(all_files, prefix, max_start, min_end, output_filename):
         cmd.extend(["-i", f])
 
     if video or audio or subs:
-        audio.sort(key=lambda e: 0 if e[2] else 1)  # stable: Hindi first, rest keep order
+        audio.sort(key=lambda e: 0 if e[2] else 1)  # stable sort: Hindi first, rest keep order
         for fi, si, _ in video + audio + subs:
             cmd.extend(["-map", f"{fi}:{si}"])
         for a_idx in range(len(audio)):
             cmd.extend([f"-disposition:a:{a_idx}", "default" if a_idx == 0 else "0"])
     else:
-        # ffprobe unavailable - fall back to file level ordering (Hindi files first among audio)
         order = sorted(
             range(len(all_files)),
             key=lambda i: 0 if filename_is_hindi(all_files[i], prefix) else 1
         )
-        vids = [i for i in order if not all_files[i].lower().endswith((".m4a", ".aac", ".mka", ".ac3", ".eac3"))]
+        vids = [i for i in order if not all_files[i].lower().endswith(AUDIO_ONLY_EXTS)]
         auds = [i for i in order if i not in vids]
         for i in vids + auds:
             cmd.extend(["-map", str(i)])
@@ -273,14 +333,7 @@ def build_mux_command(all_files, prefix, max_start, min_end, output_filename):
 
 def generate_thumbnail(video_path, thumb_path):
     try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", "00:00:03",
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "2",
-            thumb_path
-        ]
+        cmd = ["ffmpeg", "-y", "-ss", "00:00:03", "-i", video_path, "-vframes", "1", "-q:v", "2", thumb_path]
         subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if os.path.exists(thumb_path):
             return thumb_path
@@ -297,7 +350,7 @@ def make_progress_bar(percent):
 
 
 def normalize_duration(text):
-    """Return HH:MM:SS from '10' (minutes) or 'HH:MM:SS', else None."""
+    """'10' (minutes) or 'HH:MM:SS' -> 'HH:MM:SS', else None."""
     text = text.strip()
     if text.isdigit():
         mins = int(text)
@@ -311,6 +364,15 @@ def normalize_duration(text):
     return None
 
 
+def parse_duration(text):
+    """Return (valid, duration_str). duration_str is None for unlimited recording."""
+    t = text.strip().lower()
+    if t in ("inf", "infinite", "unlimited", "live", "forever", "∞"):
+        return True, None
+    d = normalize_duration(t)
+    return d is not None, d
+
+
 def safe_remove(path):
     try:
         if os.path.isdir(path):
@@ -321,6 +383,54 @@ def safe_remove(path):
         pass
 
 
+def dir_size(path):
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def lang_label(lang):
+    if not lang or lang in ("und", "unk"):
+        return None
+    return LANG_NAMES.get(lang, lang.upper())
+
+
+def channel_layout(n):
+    return {1: "1.0", 2: "2.0", 6: "5.1", 8: "7.1"}.get(n, str(n) if n else "")
+
+
+def build_caption(title, streams, actual_sec, size_bytes, planned, mode, note="", part=None):
+    lines = [f"📺 **{title}**"]
+    if part:
+        lines.append(f"📦 Part {part[0]}/{part[1]}")
+    lines.append(f"⏱ Duration: {fmt_duration(actual_sec)}" + (f"  (planned {planned})" if planned else "  (unlimited)"))
+    lines.append(f"💾 Size: {fmt_size(size_bytes)}")
+
+    vid = next((s for s in streams if s["type"] == "video"), None)
+    if vid and vid.get("width") and vid.get("height"):
+        lines.append(f"🎞 Video: {vid['width']}x{vid['height']} ({vid['codec'].upper()})")
+
+    auds = [s for s in streams if s["type"] == "audio"]
+    if auds:
+        items = []
+        for i, a in enumerate(auds, 1):
+            name = lang_label(a["lang"]) or f"Track {i}"
+            detail = " ".join(x for x in (a["codec"].upper(), channel_layout(a.get("channels"))) if x)
+            items.append(f"{name} ({detail})" if detail else name)
+        lines.append(f"🔊 Audio ({len(auds)}): " + " • ".join(items))
+
+    lines.append(f"🎨 Watermark: {'Yes' if mode == 'wm' else 'No'}")
+    lines.append(f"🕒 {datetime.now(TZ).strftime('%d %b %Y, %H:%M')} IST")
+    if note:
+        lines.append(f"⚠️ {note}")
+    return "\n".join(lines)[:1020]
+
+
 def mode_menu_markup():
     return InlineKeyboardMarkup([
         [
@@ -329,6 +439,43 @@ def mode_menu_markup():
         ],
         [InlineKeyboardButton("« Back", callback_data="prompt_search")]
     ])
+
+
+def main_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Search Channels", callback_data="prompt_search")],
+        [InlineKeyboardButton("📋 Active Recordings", callback_data="jobs_refresh")],
+        [InlineKeyboardButton("📊 Bot Status & Stats", callback_data="bot_stats")],
+        [InlineKeyboardButton("❌ Cancel All My Recordings", callback_data="cancel_active")]
+    ])
+
+
+def user_jobs(user_id):
+    return {jid: j for jid, j in jobs.items() if j["user_id"] == user_id}
+
+
+def render_jobs(user_id):
+    mine = user_jobs(user_id)
+    rows = []
+    if not mine:
+        text = "📋 **Active Recordings**\n\nNothing is recording right now."
+    else:
+        lines = ["📋 **Active Recordings**\n"]
+        for jid, j in mine.items():
+            dur = j["duration_str"] or "∞"
+            lines.append(
+                f"• `{jid}` — **{j['title']}**\n"
+                f"   {j['stage']} • ⏱ {fmt_duration(time.time() - j['start'])} / {dur}"
+            )
+            if j["stage"] == "recording":
+                rows.append([
+                    InlineKeyboardButton(f"⏹ Stop & Send {jid[:4]}", callback_data=f"job_stop_{jid}"),
+                    InlineKeyboardButton(f"❌ Cancel {jid[:4]}", callback_data=f"job_cancel_{jid}")
+                ])
+        text = "\n".join(lines)
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="jobs_refresh")])
+    rows.append([InlineKeyboardButton("« Back to Menu", callback_data="main_menu")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 # ==========================================
@@ -349,8 +496,11 @@ async def start_handler(client: Client, message: Message):
     ])
     await message.reply_text(
         "🎬 **JIO Stream Ripper Bot**\n\n"
-        "• `/s <channel>` - Search & select multiple channels\n"
-        "• `/menu` - Open interactive control dashboard",
+        "• `/s <name>` - Search & select channels\n"
+        "• `/r <num[,num2,...]> [min|HH:MM:SS|inf]` - Quick record (e.g. `/r 12 30`, `/r 12,15 inf`)\n"
+        "• `/jobs` - See / stop running recordings\n"
+        "• `/menu` - Control dashboard\n\n"
+        "You can run as many recordings in parallel as you like.",
         reply_markup=keyboard
     )
 
@@ -360,16 +510,26 @@ async def menu_handler(client: Client, message: Message):
     if not is_authorized(message.from_user):
         await message.reply_text(NOT_AUTH_TEXT)
         return
+    await message.reply_text("🎛 **Jio Bot Control Panel**\nChoose an action below:", reply_markup=main_menu_markup())
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Search Channels", callback_data="prompt_search")],
-        [InlineKeyboardButton("📊 Bot Status & Stats", callback_data="bot_stats")],
-        [InlineKeyboardButton("❌ Cancel Active Rips", callback_data="cancel_active")]
-    ])
-    await message.reply_text(
-        "🎛 **Jio Bot Control Panel**\nChoose an action below:",
-        reply_markup=keyboard
-    )
+
+@app.on_message(filters.command("jobs"))
+async def jobs_handler(client: Client, message: Message):
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
+        return
+    text, markup = render_jobs(message.from_user.id)
+    await message.reply_text(text, reply_markup=markup)
+
+
+@app.on_callback_query(filters.regex(r"^jobs_refresh$"))
+async def callback_jobs_refresh(client: Client, callback_query: CallbackQuery):
+    if not is_authorized(callback_query.from_user):
+        await callback_query.answer("Not authorized!", show_alert=True)
+        return
+    await callback_query.answer()
+    text, markup = render_jobs(callback_query.from_user.id)
+    await safe_edit(callback_query.message, text, markup)
 
 
 @app.on_callback_query(filters.regex(r"^main_menu$"))
@@ -377,20 +537,8 @@ async def callback_main_menu(client: Client, callback_query: CallbackQuery):
     if not is_authorized(callback_query.from_user):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
-
     await callback_query.answer()
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Search Channels", callback_data="prompt_search")],
-        [InlineKeyboardButton("📊 Bot Status & Stats", callback_data="bot_stats")],
-        [InlineKeyboardButton("❌ Cancel Active Rips", callback_data="cancel_active")]
-    ])
-    try:
-        await callback_query.message.edit_text(
-            "🎛 **Jio Bot Control Panel**\nChoose an action below:",
-            reply_markup=keyboard
-        )
-    except Exception:
-        pass
+    await safe_edit(callback_query.message, "🎛 **Jio Bot Control Panel**\nChoose an action below:", main_menu_markup())
 
 
 @app.on_callback_query(filters.regex(r"^prompt_search$"))
@@ -398,14 +546,12 @@ async def callback_prompt_search(client: Client, callback_query: CallbackQuery):
     if not is_authorized(callback_query.from_user):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
-
     await callback_query.answer()
-    try:
-        await callback_query.message.edit_text(
-            "🔍 **Channel Search**\nPlease send your search query using the command format:\n`/s <channel_name>` (e.g., `/s pogo` or `/s sports`)"
-        )
-    except Exception:
-        pass
+    await safe_edit(
+        callback_query.message,
+        "🔍 **Channel Search**\nSend your query as:\n`/s <channel_name>` (e.g., `/s pogo` or `/s sports`)\n\n"
+        "Already know the channel number? Use `/r <num> <minutes>`."
+    )
 
 
 @app.on_callback_query(filters.regex(r"^bot_stats$"))
@@ -417,65 +563,59 @@ async def callback_bot_stats(client: Client, callback_query: CallbackQuery):
     await callback_query.answer("Fetching live stats...")
     content = await asyncio.to_thread(fetch_fresh_playlist)
     total_channels = len(parse_playlist_blocks(content))
-    active_jobs = len(active_processes)
+    try:
+        free = shutil.disk_usage(os.getcwd()).free
+    except Exception:
+        free = 0
 
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="main_menu")]])
-    try:
-        await callback_query.message.edit_text(
-            f"📊 **Bot Operational Status**\n\n"
-            f"• **Active Rips Running:** `{active_jobs}`\n"
-            f"• **Total Playlist Channels:** `{total_channels}`\n"
-            f"• **Proxy Status:** `Connected ✅`",
-            reply_markup=keyboard
-        )
-    except Exception:
-        pass
+    await safe_edit(
+        callback_query.message,
+        f"📊 **Bot Operational Status**\n\n"
+        f"• **Recordings running (all users):** `{len(jobs)}`\n"
+        f"• **Your recordings:** `{len(user_jobs(callback_query.from_user.id))}`\n"
+        f"• **Total Playlist Channels:** `{total_channels}`\n"
+        f"• **Free Disk Space:** `{fmt_size(free)}`\n"
+        f"• **Proxy Status:** `Connected ✅`",
+        keyboard
+    )
 
 
 @app.on_callback_query(filters.regex(r"^cancel_active$"))
 async def callback_cancel_active(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
     if not is_authorized(callback_query.from_user):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
 
-    proc = active_processes.get(user_id)
-    if proc:
-        try:
-            user_job_controls[user_id] = "cancel"
-            proc.terminate()
-            await callback_query.answer("Active rip process terminated.", show_alert=True)
-        except Exception:
-            await callback_query.answer("Failed to terminate process.", show_alert=True)
-    else:
-        await callback_query.answer("No active rip found for you.", show_alert=True)
+    count = 0
+    for j in user_jobs(callback_query.from_user.id).values():
+        if j["stage"] == "recording" and j["action"] is None:
+            j["action"] = "cancel"
+            count += 1
 
+    await callback_query.answer(f"Cancelling {count} recording(s)." if count else "No active recording found.", show_alert=True)
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="main_menu")]])
-    try:
-        await callback_query.message.edit_text("❌ Active download processes cleared.", reply_markup=keyboard)
-    except Exception:
-        pass
+    await safe_edit(callback_query.message, f"❌ Cancelled {count} recording(s).", keyboard)
 
 
-@app.on_callback_query(filters.regex(r"^job_control_(pause|cancel)$"))
+@app.on_callback_query(filters.regex(r"^job_(stop|cancel)_([0-9a-f]{8})$"))
 async def job_control_callback(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
     if not is_authorized(callback_query.from_user):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
 
-    action = callback_query.matches[0].group(1)
-    user_job_controls[user_id] = action
+    action, job_id = callback_query.matches[0].group(1, 2)
+    job = jobs.get(job_id)
+    if not job or job["user_id"] != callback_query.from_user.id:
+        await callback_query.answer("This recording has already finished.", show_alert=True)
+        return
+    if job["stage"] != "recording":
+        await callback_query.answer("Recording already ended - it's being processed.", show_alert=True)
+        return
 
-    proc = active_processes.get(user_id)
-    if proc:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-    if action == "pause":
-        await callback_query.answer("⏸️ Pausing and preparing partial file...", show_alert=True)
+    job["action"] = action
+    if action == "stop":
+        await callback_query.answer("⏹ Stopping and preparing what's recorded so far...", show_alert=True)
     else:
         await callback_query.answer("❌ Recording cancelled.", show_alert=True)
 
@@ -508,15 +648,15 @@ async def search_handler(client: Client, message: Message):
     user_selected_channels[message.from_user.id] = set()
 
     keyboard = []
-    for num, data in list(matched.items())[:12]:
+    for num, data in list(matched.items())[:MAX_SEARCH_RESULTS]:
         keyboard.append([InlineKeyboardButton(f"☐ {num}. {data['name']}", callback_data=f"toggle_chan_{num}")])
 
     keyboard.append([InlineKeyboardButton("🚀 Proceed with Selected Channels", callback_data="confirm_channels")])
     keyboard.append([InlineKeyboardButton("« Back to Menu", callback_data="main_menu")])
 
+    extra = f" (showing first {MAX_SEARCH_RESULTS} - refine your search)" if len(matched) > MAX_SEARCH_RESULTS else ""
     await status_msg.edit_text(
-        f"✅ Found **{len(matched)}** channels matching `{query}`"
-        f"{' (showing first 12)' if len(matched) > 12 else ''}.\n"
+        f"✅ Found **{len(matched)}** channels matching `{query}`{extra}.\n"
         f"Tap channels to select/deselect them, then click Proceed:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -530,14 +670,13 @@ async def toggle_channel_callback(client: Client, callback_query: CallbackQuery)
         return
 
     channel_num = int(callback_query.matches[0].group(1))
-    if user_id not in user_selected_channels:
-        user_selected_channels[user_id] = set()
+    selected = user_selected_channels.setdefault(user_id, set())
 
-    if channel_num in user_selected_channels[user_id]:
-        user_selected_channels[user_id].remove(channel_num)
+    if channel_num in selected:
+        selected.remove(channel_num)
         await callback_query.answer(f"Deselected channel {channel_num}")
     else:
-        user_selected_channels[user_id].add(channel_num)
+        selected.add(channel_num)
         await callback_query.answer(f"Selected channel {channel_num}")
 
     content = await asyncio.to_thread(fetch_fresh_playlist)
@@ -554,7 +693,7 @@ async def toggle_channel_callback(client: Client, callback_query: CallbackQuery)
             if btn.callback_data and btn.callback_data.startswith("toggle_chan_"):
                 c_num = int(btn.callback_data.split("_")[2])
                 c_name = channels.get(c_num, {}).get("name", f"Channel {c_num}")
-                checked = "☑" if c_num in user_selected_channels[user_id] else "☐"
+                checked = "☑" if c_num in selected else "☐"
                 new_row.append(InlineKeyboardButton(f"{checked} {c_num}. {c_name}", callback_data=btn.callback_data))
             else:
                 new_row.append(btn)
@@ -579,15 +718,12 @@ async def confirm_channels_callback(client: Client, callback_query: CallbackQuer
         return
 
     await callback_query.answer()
-    # Audio track menu removed: all audio tracks are always recorded (Hindi is placed first when muxing)
-    try:
-        await callback_query.message.edit_text(
-            f"🎯 **Selected Channels:** `{sorted(selected)}`\n"
-            f"🎵 **Audio:** All tracks (Hindi first)\n\nChoose Recording Mode:",
-            reply_markup=mode_menu_markup()
-        )
-    except Exception:
-        pass
+    await safe_edit(
+        callback_query.message,
+        f"🎯 **Selected Channels:** `{sorted(selected)}`\n"
+        f"🎵 **Audio:** All tracks (Hindi first)\n\nChoose Recording Mode:",
+        mode_menu_markup()
+    )
 
 
 @app.on_callback_query(filters.regex(r"^mode_(norm|wm)$"))
@@ -610,15 +746,12 @@ async def mode_select_callback(client: Client, callback_query: CallbackQuery):
             InlineKeyboardButton("⏱ 1 Hour", callback_data="dur_01:00:00")
         ],
         [
-            InlineKeyboardButton("⏱ Custom Duration", callback_data="dur_custom")
+            InlineKeyboardButton("♾ Until I Stop", callback_data="dur_inf"),
+            InlineKeyboardButton("✏️ Custom", callback_data="dur_custom")
         ],
         [InlineKeyboardButton("« Back", callback_data="confirm_channels")]
     ])
-
-    await callback_query.message.edit_text(
-        "⏱ **Select Recording Duration:**",
-        reply_markup=keyboard
-    )
+    await safe_edit(callback_query.message, "⏱ **Select Recording Duration:**", keyboard)
 
 
 @app.on_callback_query(filters.regex(r"^dur_custom$"))
@@ -629,17 +762,18 @@ async def custom_duration_prompt(client: Client, callback_query: CallbackQuery):
         return
 
     user_waiting_duration[user_id] = True
-
     await callback_query.answer()
-    await callback_query.message.edit_text(
+    await safe_edit(
+        callback_query.message,
         "✏️ **Custom Duration**\n\n"
-        "Please type the recording duration in chat.\n"
-        "• Format 1: Minutes as a number (e.g. `10` for 10 minutes)\n"
-        "• Format 2: Exact timestamp `HH:MM:SS` (e.g. `00:15:00`)"
+        "Type the recording duration in chat:\n"
+        "• Minutes as a number (e.g. `10`)\n"
+        "• Exact time `HH:MM:SS` (e.g. `00:15:00`)\n"
+        "• `inf` for unlimited (stop it yourself with /jobs)"
     )
 
 
-@app.on_message(filters.text & ~filters.command(["start", "menu", "s"]))
+@app.on_message(filters.text & ~filters.command(["start", "menu", "s", "r", "jobs"]))
 async def custom_duration_text_handler(client: Client, message: Message):
     if not is_authorized(message.from_user):
         return
@@ -648,62 +782,122 @@ async def custom_duration_text_handler(client: Client, message: Message):
         return
 
     user_waiting_duration.pop(user_id, None)
-
-    duration_str = normalize_duration(message.text)
-    if not duration_str:
+    valid, duration_str = parse_duration(message.text)
+    if not valid:
         duration_str = "00:05:00"
         await message.reply_text("❌ Invalid format. Defaulting duration to `00:05:00`.")
 
-    await start_rips(client, message.chat.id, user_id, duration_str)
+    channels = sorted(user_selected_channels.get(user_id, set()))
+    if not channels:
+        await message.reply_text("❌ No channels selected. Please search again using `/s`")
+        return
+
+    user_selected_channels[user_id] = set()
+    await message.reply_text(
+        f"🚀 Starting {len(channels)} recording(s) in parallel. Track them with /jobs"
+    )
+    await start_rips(client, message.chat.id, user_id, channels, duration_str)
 
 
-@app.on_callback_query(filters.regex(r"^dur_(\d{2}:\d{2}:\d{2})$"))
+@app.on_callback_query(filters.regex(r"^dur_(\d{2}:\d{2}:\d{2}|inf)$"))
 async def preset_duration_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if not is_authorized(callback_query.from_user):
         await callback_query.answer("Not authorized!", show_alert=True)
         return
 
-    if not user_selected_channels.get(user_id):
+    channels = sorted(user_selected_channels.get(user_id, set()))
+    if not channels:
         await callback_query.answer("No channels selected.", show_alert=True)
         return
-    if user_id in running_users:
-        await callback_query.answer("A recording is already running for you.", show_alert=True)
+
+    raw = callback_query.matches[0].group(1)
+    duration_str = None if raw == "inf" else raw
+
+    await callback_query.answer("Starting recordings...")
+    user_selected_channels[user_id] = set()
+    await safe_edit(
+        callback_query.message,
+        f"🚀 Starting {len(channels)} recording(s) in parallel.\nTrack or stop them with /jobs"
+    )
+    await start_rips(client, callback_query.message.chat.id, user_id, channels, duration_str)
+
+
+@app.on_message(filters.command("r"))
+async def quick_record_handler(client: Client, message: Message):
+    """/r <num[,num2]> [minutes|HH:MM:SS|inf]  - record without the menus."""
+    if not is_authorized(message.from_user):
+        await message.reply_text(NOT_AUTH_TEXT)
         return
 
-    await callback_query.answer("Starting rip process...")
-    duration_str = callback_query.matches[0].group(1)
+    args = message.command[1:]
+    nums = [a for a in (args[0].split(",") if args else []) if a.strip()]
+    if not nums or not all(n.strip().isdigit() for n in nums):
+        await message.reply_text(
+            "⚠️ Usage: `/r <channel_number[,more]> [minutes|HH:MM:SS|inf]`\n"
+            "Examples: `/r 12 30` • `/r 12,15 00:45:00` • `/r 12 inf`\n"
+            "Default duration is 5 minutes."
+        )
+        return
 
+    channels = [int(n) for n in nums]
+    valid, duration_str = parse_duration(args[1]) if len(args) > 1 else (True, "00:05:00")
+    if not valid:
+        await message.reply_text("❌ Invalid duration. Use minutes (`30`), `HH:MM:SS` or `inf`.")
+        return
+
+    await message.reply_text(
+        f"🚀 Starting {len(channels)} recording(s) "
+        f"({duration_str or 'unlimited'}). Track them with /jobs"
+    )
+    await start_rips(client, message.chat.id, message.from_user.id, channels, duration_str)
+
+
+async def start_rips(client, chat_id, user_id, channels, duration_str):
+    """Launch every recording as an independent background task (no limit)."""
+    for channel_num in channels:
+        spawn(execute_rip_process(client, chat_id, user_id, channel_num, duration_str))
+        await asyncio.sleep(1)  # small stagger to avoid message flood limits
+
+
+# ==========================================
+# RECORDING ENGINE
+# ==========================================
+def _signal_process(proc, sig):
     try:
-        await callback_query.message.edit_text("🚀 Starting rips...")
-    except Exception:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), sig)
+        elif sig == "kill":
+            proc.kill()
+        else:
+            proc.terminate()
+    except (ProcessLookupError, PermissionError):
         pass
 
-    await start_rips(client, callback_query.message.chat.id, user_id, duration_str)
 
-
-async def start_rips(client, chat_id, user_id, duration_str):
-    selected = sorted(user_selected_channels.get(user_id, set()))
-    if not selected:
-        await client.send_message(chat_id, "❌ No channels selected. Please search again using `/s`")
+async def stop_process(proc, graceful):
+    """Stop N_m3u8DL-RE (and any child like shaka-packager). Graceful = Ctrl+C first."""
+    if proc.returncode is not None:
         return
-    if user_id in running_users:
-        await client.send_message(chat_id, "⚠️ A recording is already running. Cancel it first.")
-        return
-
-    user_selected_channels[user_id] = set()
-    running_users.add(user_id)
+    if graceful and os.name == "posix":
+        _signal_process(proc, signal.SIGINT)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=15)
+            return
+        except asyncio.TimeoutError:
+            pass
+    _signal_process(proc, signal.SIGTERM)
     try:
-        for channel_num in selected:
-            result = await execute_rip_process(client, chat_id, user_id, channel_num, duration_str)
-            if result == "cancelled":
-                break
-    finally:
-        running_users.discard(user_id)
+        await asyncio.wait_for(proc.wait(), timeout=8)
+        return
+    except asyncio.TimeoutError:
+        pass
+    _signal_process(proc, signal.SIGKILL if os.name == "posix" else "kill")
+    await proc.wait()
 
 
 async def drain_stdout(proc, tail):
-    """Consume process output so the pipe never fills up; keep a short tail for debugging."""
+    """Consume process output so the pipe never fills; keep a short tail for debugging."""
     try:
         while True:
             chunk = await proc.stdout.read(4096)
@@ -716,118 +910,157 @@ async def drain_stdout(proc, tail):
         pass
 
 
-async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str):
-    status_msg = await client.send_message(chat_id, f"⏳ Preparing channel `{channel_num}`...")
-
-    content = await asyncio.to_thread(fetch_fresh_playlist)
-    if not content:
-        await status_msg.edit_text("❌ Error fetching live playlist through proxy.")
-        return "error"
-
-    fresh_channels = parse_playlist_blocks(content)
-    if channel_num not in fresh_channels:
-        await status_msg.edit_text(f"❌ Channel `{channel_num}` not found in fresh playlist.")
-        return "error"
-
-    url, clean_name, drm_keys, headers = parse_m3u_block(fresh_channels[channel_num]["block"])
-    if not url:
-        await status_msg.edit_text(f"❌ Error: Could not extract stream URL for channel {channel_num}.")
-        return "error"
-
-    channel_title = fresh_channels[channel_num]["name"]
-    record_mode = user_record_mode.get(user_id, "norm")
-
-    job_id = f"{user_id}_{int(time.time())}"
-    temp_prefix_local = f"raw_stream_{job_id}"
-    output_filename = f"{clean_name}_{job_id}.mkv"
-    watermarked_path = f"wm_{output_filename}"
-    thumb_path_local = f"thumb_{job_id}.jpg"
-
-    command = [
-        "N_m3u8DL-RE",
-        url,
-        "--save-name", temp_prefix_local,
-        "--use-shaka-packager",
-        "--live-real-time-merge",
-        "--live-record-limit", duration_str,
-        "--custom-proxy", DOWNLOAD_PROXY,
-        "--select-video", "best",
-        "--select-audio", AUDIO_SELECTION,   # always all audio tracks
-        "--thread-count", "16"
+async def split_file(path, out_dir, total_sec, size_bytes):
+    """Split a too-big file into parts below Telegram's limit (cut on keyframes, no re-encode)."""
+    parts = max(2, math.ceil(size_bytes / SPLIT_TARGET))
+    seg_time = max(60, int(total_sec / parts))
+    pattern = os.path.join(out_dir, "part_%02d.mkv")
+    cmd = [
+        "ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy",
+        "-f", "segment", "-segment_time", str(seg_time), "-reset_timestamps", "1", pattern
     ]
-    command.extend(headers)
-    command.extend(drm_keys)
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    await proc.communicate()
+    return sorted(glob.glob(os.path.join(out_dir, "part_*.mkv")))
 
-    user_job_controls[user_id] = None
-    result_status = "error"
+
+async def execute_rip_process(client, chat_id, user_id, channel_num, duration_str):
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    job = {
+        "user_id": user_id, "chat_id": chat_id, "channel_num": channel_num,
+        "title": f"Channel {channel_num}", "duration_str": duration_str,
+        "proc": None, "action": None, "stage": "starting", "start": time.time(), "note": ""
+    }
+    jobs[job_id] = job
+    status_msg = None
 
     try:
-        control_markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("⏸️ Pause & Send", callback_data="job_control_pause"),
-                InlineKeyboardButton("❌ Cancel", callback_data="job_control_cancel")
-            ]
-        ])
+        status_msg = await client.send_message(chat_id, f"⏳ Preparing channel `{channel_num}`...")
 
-        def progress_text(pct):
+        content = await asyncio.to_thread(fetch_fresh_playlist)
+        if not content:
+            await safe_edit(status_msg, "❌ Error fetching live playlist through proxy.")
+            return "error"
+
+        fresh_channels = parse_playlist_blocks(content)
+        if channel_num not in fresh_channels:
+            await safe_edit(status_msg, f"❌ Channel `{channel_num}` not found in fresh playlist.")
+            return "error"
+
+        url, clean_name, drm_keys, headers = parse_m3u_block(fresh_channels[channel_num]["block"])
+        if not url:
+            await safe_edit(status_msg, f"❌ Could not extract stream URL for channel {channel_num}.")
+            return "error"
+
+        title = fresh_channels[channel_num]["name"]
+        job["title"] = title
+        record_mode = user_record_mode.get(user_id, "norm")
+
+        stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        output_filename = os.path.join(job_dir, f"{clean_name}_{stamp}.mkv")
+        watermarked_path = os.path.join(job_dir, f"wm_{clean_name}_{stamp}.mkv")
+        thumb_path_local = os.path.join(job_dir, "thumb.jpg")
+
+        command = [
+            "N_m3u8DL-RE", url,
+            "--save-name", TEMP_PREFIX,
+            "--save-dir", job_dir,
+            "--tmp-dir", job_dir,
+            "--use-shaka-packager",
+            "--live-real-time-merge",
+        ]
+        if duration_str:
+            command.extend(["--live-record-limit", duration_str])
+        command.extend([
+            "--custom-proxy", DOWNLOAD_PROXY,
+            "--select-video", "best",
+            "--select-audio", AUDIO_SELECTION,
+            "--thread-count", "16"
+        ])
+        command.extend(headers)
+        command.extend(drm_keys)
+
+        control_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⏹ Stop & Send", callback_data=f"job_stop_{job_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"job_cancel_{job_id}")
+        ]])
+
+        total_expected_sec = 0
+        if duration_str:
+            h, m, s = map(int, duration_str.split(':'))
+            total_expected_sec = h * 3600 + m * 60 + s
+
+        def progress_text(elapsed, size_now):
+            if total_expected_sec:
+                pct = int(min(99, elapsed / total_expected_sec * 100))
+                body = make_progress_bar(pct)
+                target = duration_str
+            else:
+                body = "♾ Unlimited - recording until you press Stop"
+                target = "Unlimited"
             return (
-                f"⏺ **Ripping Channel {channel_num}:** `{channel_title}`\n"
-                f"⏱ Target Duration: `{duration_str}`\n\n{make_progress_bar(pct)}"
+                f"⏺ **Ripping Channel {channel_num}:** `{title}`\n"
+                f"🆔 `{job_id}`\n"
+                f"🎯 Target: `{target}`\n"
+                f"⏱ Elapsed: `{fmt_duration(elapsed)}`\n"
+                f"💾 Recorded: `{fmt_size(size_now)}`\n\n{body}"
             )
 
-        await status_msg.edit_text(progress_text(0), reply_markup=control_markup)
+        await safe_edit(status_msg, progress_text(0, 0), control_markup)
 
+        popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
         proc = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT
+            *command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=job_dir, **popen_kwargs
         )
-        active_processes[user_id] = proc
+        job["proc"] = proc
+        job["stage"] = "recording"
+        job["start"] = time.time()
         tail = []
         drain_task = asyncio.create_task(drain_stdout(proc, tail))
 
-        h, m, s = map(int, duration_str.split(':'))
-        total_expected_sec = h * 3600 + m * 60 + s
-        start_time = time.time()
-        last_pct = -1
-
+        last_edit = 0
         while proc.returncode is None:
-            if user_job_controls.get(user_id) in ("pause", "cancel"):
+            if job["action"] in ("stop", "cancel"):
                 break
 
-            elapsed = time.time() - start_time
-            pct = int(min(99, (elapsed / total_expected_sec) * 100)) if total_expected_sec > 0 else 0
-            if pct != last_pct:
-                try:
-                    await status_msg.edit_text(progress_text(pct), reply_markup=control_markup)
-                    last_pct = pct
-                except Exception:
-                    pass
-
+            now = time.time()
             try:
-                await asyncio.wait_for(proc.wait(), timeout=4)
-            except asyncio.TimeoutError:
-                pass
-
-        if proc.returncode is None:
-            try:
-                proc.terminate()
+                if shutil.disk_usage(JOBS_DIR).free < MIN_FREE_BYTES:
+                    job["action"] = "stop"
+                    job["note"] = "Stopped early: low disk space"
+                    break
             except Exception:
                 pass
+
+            if now - last_edit >= PROGRESS_INTERVAL:
+                last_edit = now
+                size_now = await asyncio.to_thread(dir_size, job_dir)
+                await safe_edit(status_msg, progress_text(now - job["start"], size_now), control_markup)
+
+            await asyncio.sleep(1)
+
+        action_taken = job["action"]
+        if proc.returncode is None:
+            await stop_process(proc, graceful=(action_taken != "cancel"))
         await proc.wait()
         await drain_task
-        active_processes.pop(user_id, None)
+        elapsed_total = time.time() - job["start"]
 
-        action_taken = user_job_controls.pop(user_id, None)
         if action_taken == "cancel":
-            await status_msg.edit_text("❌ Recording cancelled by user.")
-            result_status = "cancelled"
-            return result_status
+            await safe_edit(status_msg, f"❌ Recording of `{title}` cancelled.")
+            return "cancelled"
 
         # ==========================================
         # SMART MUXING (Hindi audio first)
         # ==========================================
-        all_raw = [f for f in glob.glob(f"{temp_prefix_local}*") if os.path.isfile(f)]
+        job["stage"] = "muxing"
+        all_raw = [
+            os.path.join(job_dir, f) for f in os.listdir(job_dir)
+            if f.startswith(TEMP_PREFIX) and os.path.isfile(os.path.join(job_dir, f))
+        ]
         all_files = [f for f in all_raw if f.lower().endswith(MEDIA_EXTS)]
         if not all_files:
             all_files = [f for f in all_raw if not f.endswith(('.jpg', '.srt', '.vtt'))]
@@ -835,10 +1068,10 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
 
         if not all_files:
             logger.error("N_m3u8DL-RE output tail: %s", "".join(tail)[-1500:])
-            await status_msg.edit_text("❌ Error: No decrypted tracks found.")
+            await safe_edit(status_msg, f"❌ `{title}`: no decrypted tracks found (stream may be offline or keys expired).")
             return "error"
 
-        await status_msg.edit_text(f"⚙️ **Smart Muxing & Syncing Tracks (Hindi audio first)...**\n\n{make_progress_bar(50)}")
+        await safe_edit(status_msg, f"⚙️ **Muxing `{title}` (Hindi audio first)...**\n\n{make_progress_bar(50)}")
 
         max_start = 0.0
         min_end = float('inf')
@@ -850,89 +1083,121 @@ async def execute_rip_process(client, chat_id, user_id, channel_num, duration_st
                 min_end = end
 
         mux_cmd = await asyncio.to_thread(
-            build_mux_command, all_files, temp_prefix_local, max_start, min_end, output_filename
+            build_mux_command, all_files, TEMP_PREFIX, max_start, min_end, output_filename
         )
-        logger.info("Mux command: %s", " ".join(mux_cmd))
+        logger.info("[%s] Mux command: %s", job_id, " ".join(mux_cmd))
 
-        mux_proc = await asyncio.create_subprocess_exec(
-            *mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        mux_proc = await asyncio.create_subprocess_exec(*mux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         _, mux_err = await mux_proc.communicate()
 
         if not os.path.exists(output_filename) or os.path.getsize(output_filename) < 10000:
-            logger.error("Mux failed: %s", mux_err.decode("utf-8", errors="ignore")[-1500:])
-            await status_msg.edit_text("❌ Error: Muxing failed (output file missing or empty).")
+            logger.error("[%s] Mux failed: %s", job_id, mux_err.decode("utf-8", errors="ignore")[-1500:])
+            await safe_edit(status_msg, f"❌ `{title}`: muxing failed (output missing or empty).")
             return "error"
 
         final_file = output_filename
 
         if record_mode == "wm":
-            await status_msg.edit_text(f"🎨 **Applying Watermark Filter...**\n\n{make_progress_bar(50)}")
-            wm_filter = get_watermark_drawtext_filter()
-
+            await safe_edit(status_msg, f"🎨 **Applying watermark to `{title}`...**\n\n{make_progress_bar(50)}")
             ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-i", output_filename,
-                "-map", "0",
-                "-vf", wm_filter,
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-c:a", "copy",
-                "-c:s", "copy",
+                "ffmpeg", "-y", "-i", output_filename, "-map", "0",
+                "-vf", get_watermark_drawtext_filter(),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "copy", "-c:s", "copy",
                 watermarked_path
             ]
-
             ff_proc = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             await ff_proc.communicate()
-
             if os.path.exists(watermarked_path) and os.path.getsize(watermarked_path) > 50000:
                 final_file = watermarked_path
 
+        # ---- gather info for the caption ----
+        streams = await asyncio.to_thread(probe_streams, final_file)
+        start_abs, end_abs = await asyncio.to_thread(get_media_info, final_file)
+        actual_sec = end_abs - start_abs
+        if not (0 < actual_sec < float('inf')):
+            actual_sec = elapsed_total
         thumb_path = await asyncio.to_thread(generate_thumbnail, final_file, thumb_path_local)
 
-        try:
-            start_abs, final_duration_abs = await asyncio.to_thread(get_media_info, final_file)
-            video_duration_sec = int(final_duration_abs - start_abs)
-            if video_duration_sec <= 0:
-                video_duration_sec = 60
-        except Exception:
-            video_duration_sec = 60
+        final_size = os.path.getsize(final_file)
+        upload_list = [final_file]
+        if final_size > TG_LIMIT:
+            await safe_edit(
+                status_msg,
+                f"✂️ **File is {fmt_size(final_size)} - splitting into parts for Telegram...**"
+            )
+            parts = await split_file(final_file, job_dir, actual_sec, final_size)
+            if parts:
+                upload_list = parts
 
-        suffix_label = " (Paused & Sent)" if action_taken == "pause" else ""
-        await status_msg.edit_text(f"⬆️ **Uploading to Telegram{suffix_label}...**\n\n{make_progress_bar(50)}")
+        # ---- upload ----
+        job["stage"] = "uploading"
+        note = job["note"] or ("Stopped manually" if action_taken == "stop" else "")
+        for idx, path in enumerate(upload_list, 1):
+            part_info = (idx, len(upload_list)) if len(upload_list) > 1 else None
+            part_label = f" (part {idx}/{len(upload_list)})" if part_info else ""
+            size_p = os.path.getsize(path)
 
-        await client.send_video(
-            chat_id=chat_id,
-            video=final_file,
-            duration=video_duration_sec,
-            thumb=thumb_path if thumb_path else None,
-            supports_streaming=True,
-            caption=f"📺 Channel: {channel_title}{suffix_label}\n⏱ Duration: {duration_str}"
-        )
+            if part_info:
+                p_start, p_end = await asyncio.to_thread(get_media_info, path)
+                part_sec = (p_end - p_start) if 0 < (p_end - p_start) < float('inf') else actual_sec / len(upload_list)
+            else:
+                part_sec = actual_sec
+
+            caption = build_caption(
+                title, streams, part_sec, size_p, duration_str, record_mode, note, part_info
+            )
+
+            last_prog = {"t": 0}
+
+            async def upload_progress(current, total, _label=part_label):
+                now = time.time()
+                if current != total and now - last_prog["t"] < 6:
+                    return
+                last_prog["t"] = now
+                pct = int(current * 100 / total) if total else 0
+                await safe_edit(
+                    status_msg,
+                    f"⬆️ **Uploading `{title}`{_label}**\n"
+                    f"{fmt_size(current)} / {fmt_size(total)}\n\n{make_progress_bar(pct)}"
+                )
+
+            await safe_edit(status_msg, f"⬆️ **Uploading `{title}`{part_label}...**\n\n{make_progress_bar(0)}")
+            await client.send_video(
+                chat_id=chat_id,
+                video=path,
+                duration=max(1, int(part_sec)),
+                thumb=thumb_path if thumb_path else None,
+                supports_streaming=True,
+                caption=caption,
+                progress=upload_progress
+            )
+
         try:
             await status_msg.delete()
         except Exception:
             pass
-
-        result_status = "ok"
-        return result_status
+        return "ok"
 
     except Exception as e:
-        logger.exception("Rip failed")
-        try:
-            await status_msg.edit_text(f"❌ Error during execution: {e}")
-        except Exception:
-            pass
+        logger.exception("[%s] Rip failed", job_id)
+        await safe_edit(status_msg, f"❌ Error during execution: {e}")
         return "error"
 
     finally:
-        active_processes.pop(user_id, None)
-        user_job_controls.pop(user_id, None)
-        for f in glob.glob(f"{temp_prefix_local}*") + [output_filename, watermarked_path, thumb_path_local]:
-            safe_remove(f)
+        proc_ref = job.get("proc")
+        if proc_ref is not None and proc_ref.returncode is None:
+            try:
+                await stop_process(proc_ref, graceful=False)
+            except Exception:
+                pass
+        jobs.pop(job_id, None)
+        safe_remove(job_dir)
 
 
 if __name__ == "__main__":
-    print("Bot starting up with multi-audio (Hindi first) support...", flush=True)
+    # wipe leftovers from a previous crash, then make a clean jobs folder
+    safe_remove(JOBS_DIR)
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    print("Bot starting up: unlimited parallel recordings, Hindi-first multi-audio...", flush=True)
     app.run()
