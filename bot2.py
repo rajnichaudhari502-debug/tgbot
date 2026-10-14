@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 API_ID = 31135256
 API_HASH = "6b31bb267109963bac7ddb8dd37fe09c"
-BOT_TOKEN = "8938316203:AAHTUfaP8qwgLOo3JPw8xw5mQYCibl_u_k8"
+BOT_TOKEN = "8938316203:AAFI1MMPoNXCwqf6p5yMnhkOZZuNM-Oo02Y"
 PLAYLIST_URL = "http://premiumplugx.top/jiostb/mjelo.php?view=raw"
 
 DOWNLOAD_PROXY = "http://kunanisaitarun:nxx9ge29bp0e@103.243.119.172:59100"
@@ -531,4 +531,42 @@ async def instant_rip_callback(client: Client, callback_query: CallbackQuery):
             
             if os.path.exists(watermarked_path) and os.path.getsize(watermarked_path) > 50000:
                 final_file = watermarked_path
-            await status_msg.edit_text(f"🎨 **Watermar
+            await status_msg.edit_text(f"🎨 **Watermark Applied!**\n\n{make_progress_bar(100)}")
+            await asyncio.sleep(1)
+
+        thumb_path = await asyncio.to_thread(generate_thumbnail, final_file, thumb_path_local)
+
+        try:
+            start_abs, final_duration_abs = await asyncio.to_thread(get_media_info, final_file)
+            video_duration_sec = int(final_duration_abs - start_abs)
+            if video_duration_sec <= 0:
+                video_duration_sec = total_expected_sec
+        except Exception:
+            video_duration_sec = total_expected_sec
+
+        await status_msg.edit_text(f"⬆️ **Uploading to Telegram...**\n\n{make_progress_bar(50)}")
+
+        await client.send_video(
+            chat_id=callback_query.message.chat.id,
+            video=final_file,
+            duration=video_duration_sec,
+            thumb=thumb_path if thumb_path else None,
+            caption=f"📺 Channel: {fresh_channels[channel_num]['name']}\n⏱ Duration: {duration_str}"
+        )
+        await status_msg.delete()
+
+        # Cleanup unique temporary files for this job
+        for f in all_tracks + [output_filename, f"wm_{output_filename}", thumb_path_local]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    except Exception as e:
+        if user_id in active_processes:
+            del active_processes[user_id]
+        await status_msg.edit_text(f"❌ Error during rip execution: {e}")
+
+if __name__ == "__main__":
+    print("Bot starting up with Hindi-first audio sorting & unique job sessions...", flush=True)
+    app.run()
