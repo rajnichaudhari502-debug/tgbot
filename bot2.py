@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 API_ID = 31135256
 API_HASH = "6b31bb267109963bac7ddb8dd37fe09c"
-BOT_TOKEN = "8938316203:AAHTUfaP8qwgLOo3JPw8xw5mQYCibl_u_k8"
+BOT_TOKEN = "8938316203:AAGDso3nLjuh0Ea9AsTQA9j9PGOHzGo0RwE"
 PLAYLIST_URL = "http://premiumplugx.top/jiostb/mjelo.php?view=raw"
 
 DOWNLOAD_PROXY = "http://kunanisaitarun:nxx9ge29bp0e@103.243.119.172:59100"
